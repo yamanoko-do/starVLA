@@ -12,6 +12,10 @@ from typing import Dict, List, Tuple
 ## {nakename: [(data_name, sampling_weight, robot_type)] }
 DATASET_NAMED_MIXTURES = {
 
+    "fold_clothes": [
+        ("kai0_0429", 1.0, "fold_clothes_aloha"),
+    ],
+
     "custom_dataset": [
         ("custom_dataset_name", 1.0, "custom_robot_config"),
     ],

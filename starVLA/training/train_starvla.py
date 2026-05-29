@@ -22,7 +22,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-import wandb
+import swanlab as wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
@@ -162,7 +162,7 @@ class VLATrainer(TrainerUtils):
                 dir=os.path.join(self.config.output_dir, "wandb"),
                 project=self.config.wandb_project,
                 entity=self.config.wandb_entity,
-                group="vla-train",
+                #group="vla-train",
             )
 
     def _save_initial_configs(self):
@@ -268,8 +268,8 @@ class VLATrainer(TrainerUtils):
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
-                metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+                metrics[f"train/learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
+            #metrics["train/epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
             wandb.log(metrics, step=self.completed_steps)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
@@ -325,8 +325,6 @@ class VLATrainer(TrainerUtils):
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -342,7 +340,7 @@ class VLATrainer(TrainerUtils):
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
         output_dict = self.accelerator.unwrap_model(self.model).predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
+            examples=examples,
         )
 
         if self.accelerator.is_main_process:
@@ -350,7 +348,7 @@ class VLATrainer(TrainerUtils):
             actions = np.array(actions)
             num_pots = np.prod(actions.shape)
             score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            step_metrics["mse_score"] = score / num_pots
+            step_metrics["eval/mse_score"] = score / num_pots
 
         del examples
         dist.barrier()
@@ -360,7 +358,16 @@ class VLATrainer(TrainerUtils):
         """Record training config."""
         if self.accelerator.is_main_process:
             logger.info("***** Training Configuration *****")
-            logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
+            n_samples = len(self.vla_train_dataloader.dataset)
+            steps_per_epoch = len(self.vla_train_dataloader)
+            max_steps = self.config.trainer.max_train_steps
+            epochs = max_steps / steps_per_epoch if steps_per_epoch > 0 else 0
+
+            logger.info("***** Training Configuration *****")
+            logger.info(f"  Total samples in dataset = {n_samples:,}")
+            logger.info(f"  Steps per epoch (samples / batch_size) = {steps_per_epoch:,}")
+            logger.info(f"  Total optimization steps = {max_steps:,}")
+            logger.info(f"  Epochs covered by {max_steps:,} steps = {epochs:.2f}")
             logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
@@ -390,7 +397,7 @@ class VLATrainer(TrainerUtils):
                 self.lr_scheduler.step()
 
         return {
-            "action_dit_loss": action_loss.item(),
+            "train/action_loss": action_loss.item(),
         }
 
     def _finalize_training(self):

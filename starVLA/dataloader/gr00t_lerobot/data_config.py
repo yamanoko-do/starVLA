@@ -446,7 +446,7 @@ class Libero4in1DataConfig:
         "video.primary_image",
         "video.wrist_image",
     ]
-    
+
     state_keys = [
         "state.x",
         "state.y",
@@ -466,7 +466,7 @@ class Libero4in1DataConfig:
         "action.yaw",
         "action.gripper",
     ]
-    
+
     language_keys = ["annotation.human.action.task_description"]
 
     observation_indices = [0]
@@ -1078,9 +1078,125 @@ class VLAArenaFrankaDataConfig:
 
 
 ###########################################################################################
+#  Fold Clothes (ALOHA) — Zone multi-frame
+###########################################################################################
+
+
+def _fib_offsets(n):
+    """Fibonacci offsets: 1, 2, 3, 5, 8, 13, ..."""
+    if n <= 0:
+        return []
+    a, b = 1, 2
+    seq = [a]
+    for _ in range(n - 1):
+        seq.append(b)
+        a, b = b, a + b
+    return seq
+
+
+class FoldClothesDataConfig:
+    embodiment_tag = EmbodimentTag.ALOHA
+
+    # Set to a subset to keep only those cameras, e.g. ["cam_high"].
+    # None or empty list = all cameras.  Valid names: cam_high, cam_left_wrist, cam_right_wrist.
+    CAMERA_FILTER: list[str] | None = None
+
+    _ALL_VIDEO_KEYS = [
+        "video.cam_high",
+        "video.cam_left_wrist",
+        "video.cam_right_wrist",
+    ]
+
+    @property
+    def video_keys(self):
+        # data_cfg["cameras"] overrides CAMERA_FILTER classvar.
+        # e.g. data_cfg={"cameras": ["cam_high"]} → only head camera.
+        cameras = self.CAMERA_FILTER
+        if hasattr(self, "_data_cfg") and self._data_cfg:
+            cams = self._data_cfg.get("cameras")
+            if cams is not None:
+                cameras = cams
+        if cameras:
+            keep = set(cameras)
+            return [k for k in self._ALL_VIDEO_KEYS
+                    if k.replace("video.", "") in keep]
+        return list(self._ALL_VIDEO_KEYS)
+
+    def set_data_cfg(self, cfg: dict | None):
+        """Receive per-dataset data_cfg (called by make_LeRobotSingleDataset)."""
+        self._data_cfg = cfg or {}
+    state_keys = [
+        "state.state",
+    ]
+    action_keys = [
+        "action.action",
+    ]
+    language_keys = ["annotation.task_index"]
+
+    # --- multi-frame sampling (Zone) ---
+    MAX_VIDEO_FRAMES = 8     # image frames per camera (Fibonacci offsets from current)
+    STATE_HISTORY_LEN = 50   # joint state history length (uniform)
+    ACTION_CHUNK = 8         # future action steps
+
+    @property
+    def observation_indices(self):
+        n_frames = self.MAX_VIDEO_FRAMES
+        # data_cfg["max_video_frames"] overrides MAX_VIDEO_FRAMES classvar
+        if hasattr(self, "_data_cfg") and self._data_cfg:
+            n_frames = self._data_cfg.get("max_video_frames", n_frames)
+        n_hist = n_frames - 1
+        fibs = _fib_offsets(n_hist) if n_hist > 0 else []
+        return sorted([-f for f in fibs] + [0])
+
+    @property
+    def action_indices(self):
+        return list(range(self.ACTION_CHUNK))
+
+    @property
+    def state_indices(self):
+        n_state = self.STATE_HISTORY_LEN
+        if hasattr(self, "_data_cfg") and self._data_cfg:
+            n_state = self._data_cfg.get("state_history_len", n_state)
+        # [-n+1, ..., 0] — n frames including current state s_t
+        return list(range(-n_state + 1, 1))
+
+    def modality_config(self):
+        video_modality = ModalityConfig(
+            delta_indices=self.observation_indices,
+            modality_keys=self.video_keys,
+        )
+        state_modality = ModalityConfig(
+            delta_indices=self.state_indices,
+            modality_keys=self.state_keys,
+        )
+        action_modality = ModalityConfig(
+            delta_indices=self.action_indices,
+            modality_keys=self.action_keys,
+        )
+        language_modality = ModalityConfig(
+            delta_indices=[0],
+            modality_keys=self.language_keys,
+        )
+        return {
+            "video": video_modality,
+            "state": state_modality,
+            "action": action_modality,
+            "language": language_modality,
+        }
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionToTensor(apply_to=self.action_keys),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+
+###########################################################################################
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
+    "fold_clothes_aloha": FoldClothesDataConfig(),
     "oxe_droid": OxeDroidDataConfig(),
     "oxe_bridge": OxeBridgeDataConfig(),
     "oxe_rt1": OxeRT1DataConfig(),

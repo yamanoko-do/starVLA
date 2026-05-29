@@ -39,6 +39,8 @@ def make_LeRobotSingleDataset(
     """
     
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    if hasattr(data_config, "set_data_cfg"):
+        data_config.set_data_cfg(data_cfg)
     modality_config = data_config.modality_config()
     transforms = data_config.transform()
     dataset_path = data_root_dir / data_name

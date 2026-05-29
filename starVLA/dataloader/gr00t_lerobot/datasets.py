@@ -1380,9 +1380,9 @@ class LeRobotSingleDataset(Dataset):
         """Pack transformed modality data into training sample format."""
         step_images = []
         for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+            # Keep all temporal frames (not just [0]); each camera → list of PIL Images
+            frames = [Image.fromarray(f).resize((224, 224)) for f in data[video_key]]
+            step_images.append(frames)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1394,8 +1394,13 @@ class LeRobotSingleDataset(Dataset):
             "action": action,
             "image": step_images,
             "lang": language,
-            "robot_tag": self.tag
+            "robot_tag": self.tag,
         }
+        # Attach fps + sample indices so model can compute accurate video timestamps
+        if hasattr(self, "lerobot_info_meta"):
+            sample["fps"] = float(self.lerobot_info_meta.get("fps", 30.0))
+        if "video" in self.modality_configs:
+            sample["sample_indices"] = list(self.modality_configs["video"].delta_indices)
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []
