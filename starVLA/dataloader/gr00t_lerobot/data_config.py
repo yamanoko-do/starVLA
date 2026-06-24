@@ -1193,6 +1193,129 @@ class FoldClothesDataConfig:
 
 
 ###########################################################################################
+#  QwenZone (RoboTwin) — multi-step sequence for the memory-token framework
+###########################################################################################
+
+
+class QwenZoneRobotwinDataConfig:
+    """RoboTwin + QwenZone: consecutive T-step observations + (T+H-1) single-step
+    actions + T-step state.
+
+    Produces per example:
+      - image: [cam][T frames]   (3 cameras, T consecutive frames, delta=0..T-1)
+      - action: (T + H - 1, action_dim)  → framework slices it into T chunks of H=50
+      - state:  (T, action_dim)          (requires ``include_state: true``)
+
+    Time alignment: ``base_index`` is the current step; the T observation frames are
+    ``base_index .. base_index+T-1``; action chunk at step t covers
+    ``base_index+t .. base_index+t+H-1``.
+    """
+
+    embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+
+    video_keys = [
+        "video.cam_high",
+        "video.cam_left_wrist",
+        "video.cam_right_wrist",
+    ]
+    state_keys = [
+        "state.left_joints",
+        "state.right_joints",
+        "state.left_gripper",
+        "state.right_gripper",
+    ]
+    action_keys = [
+        "action.left_joints",
+        "action.right_joints",
+        "action.left_gripper",
+        "action.right_gripper",
+    ]
+    # per-key dims (required by PolicyNormProcessor for non-uniform action/state keys)
+    action_key_dims = {
+        "action.left_joints": 6,
+        "action.right_joints": 6,
+        "action.left_gripper": 1,
+        "action.right_gripper": 1,
+    }
+    state_key_dims = {
+        "state.left_joints": 6,
+        "state.right_joints": 6,
+        "state.left_gripper": 1,
+        "state.right_gripper": 1,
+    }
+    language_keys = ["annotation.human.action.task_description"]
+
+    T_OBS = 4            # sequence time steps (override via data_cfg["T_obs"])
+    ACTION_HORIZON = 50  # H: action chunk length predicted at each step
+
+    def set_data_cfg(self, cfg: dict | None):
+        """Receive per-dataset data_cfg (called by make_LeRobotSingleDataset)."""
+        self._data_cfg = cfg or {}
+
+    @property
+    def _T(self) -> int:
+        cfg = getattr(self, "_data_cfg", None) or {}
+        return int(cfg.get("T_obs", self.T_OBS))
+
+    @property
+    def observation_indices(self):
+        # consecutive T frames relative to current step
+        return list(range(self._T))
+
+    @property
+    def action_indices(self):
+        # T + H - 1 single-step actions → sliced into T chunks of H
+        return list(range(self._T + self.ACTION_HORIZON - 1))
+
+    @property
+    def state_indices(self):
+        return list(range(self._T))
+
+    def modality_config(self):
+        return {
+            "video": ModalityConfig(delta_indices=self.observation_indices, modality_keys=self.video_keys),
+            "state": ModalityConfig(delta_indices=self.state_indices, modality_keys=self.state_keys),
+            "action": ModalityConfig(delta_indices=self.action_indices, modality_keys=self.action_keys),
+            "language": ModalityConfig(delta_indices=[0], modality_keys=self.language_keys),
+        }
+
+    def transform(self):
+        transforms = [
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "state.left_joints": "min_max",
+                    "state.right_joints": "min_max",
+                    "state.left_gripper": "binary",
+                    "state.right_gripper": "binary",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                binary_threshold=0.49,
+                normalization_modes={
+                    "action.left_joints": "min_max",
+                    "action.right_joints": "min_max",
+                    "action.left_gripper": "binary",
+                    "action.right_gripper": "binary",
+                },
+            ),
+        ]
+        return ComposedModalityTransform(transforms=transforms)
+
+    def make_dataset(self, dataset_path, modality_configs, transforms, embodiment_tag, video_backend, delete_pause_frame, data_cfg, dataset_name):
+        """Factory hook: return an HDF5-based dataset for raw RoboTwin data."""
+        from starVLA.dataloader.gr00t_lerobot.hdf5_robotwin_dataset import HDF5RobotwinDataset
+
+        T = int(data_cfg.get("T_obs", self.T_OBS)) if data_cfg else self.T_OBS
+        H = int(data_cfg.get("action_horizon", self.ACTION_HORIZON)) if data_cfg else self.ACTION_HORIZON
+        return HDF5RobotwinDataset(dataset_path, T=T, H=H)
+
+
+###########################################################################################
 
 ROBOT_TYPE_CONFIG_MAP = {
     "libero_franka": Libero4in1DataConfig(),
@@ -1205,6 +1328,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "arx_x5": ArxX5DataConfig(),
     "robotwin": AgilexDataConfig(),
     "robotwin50": AgilexData50Config(),
+    "robotwin_qwenzone": QwenZoneRobotwinDataConfig(),
     "fourier_gr1_arms_waist": FourierGr1ArmsWaistDataConfig(),
     "vla_arena_franka": VLAArenaFrankaDataConfig(),
 

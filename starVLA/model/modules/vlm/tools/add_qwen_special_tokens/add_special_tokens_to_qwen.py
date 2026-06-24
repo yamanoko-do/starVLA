@@ -179,7 +179,7 @@ def main():
 
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_id,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         dtype=torch.bfloat16,
         device_map="cuda",
     )
@@ -228,5 +228,6 @@ def start_debugpy_once():
 
 
 if __name__ == "__main__":
-    start_debugpy_once()
+    if os.getenv("DEBUGPY_ENABLE", "0") == "1":
+        start_debugpy_once()
     main()

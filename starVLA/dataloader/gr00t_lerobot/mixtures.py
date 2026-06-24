@@ -94,6 +94,13 @@ DATASET_NAMED_MIXTURES = {
         ("arx_x5", 1.0, "arx_x5"),
     ],
 
+    "beat_block_hammer": [
+        ("beat_block_hammer", 1.0, "robotwin_qwenzone"),
+    ],
+    "click_bell": [
+        ("click_bell", 1.0, "robotwin_qwenzone"),
+    ],
+
     "robotwin_all": [
         ("Clean/adjust_bottle", 1.0, "robotwin"),
         ("Clean/beat_block_hammer", 1.0, "robotwin"),

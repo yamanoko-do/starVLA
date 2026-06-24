@@ -1,0 +1,85 @@
+# QwenZone Phase 1 training config — RoboTwin 2.0
+# memory-token VLA with block-wise attention
+#
+# Usage:
+#   python starVLA/training/train_starvla.py \
+#     --config examples/Robotwin/train_files/starvla_qwenzone_robotwin.yaml
+run_id: qwenzone_click_bell_t4
+run_root_dir: results/Checkpoints_QwenZone
+seed: 42
+wandb_entity: qwenzone
+wandb_project: qwenzone
+is_debug: false
+version_id: "0.1"
+
+framework:
+  name: QwenZone
+  qwenvl:
+    base_vlm: /mnt/workspace/yama/starVLA/playground/Pretrained_models/Qwen3-VL-4B-Instruct-MemoryAction
+    attn_implementation: sdpa                     # 4D additive mask requires sdpa
+
+  qwenzone:
+    T_obs: 4                                       # sequence time steps (match dataset T_obs)
+    N_act: 4                                       # action-intent tokens per step
+    N_mem: 4                                       # memory tokens per step
+    max_history: 16                                # inference history cap
+    stereo:
+      ckpt_path: /mnt/workspace/yama/OpenStereo/output/MultiDataset/WAVEStereo/wavestereo_mixdataset/20260623_wavestereo_filter/ckpt/checkpoint_epoch_2.pth
+      update_iters: 4                              # N iterations of update_block
+      pool_size: 8                                 # spatial grid for pooling
+      N_stereo_tokens: 8                           # output token count
+
+  action_model:
+    action_model_type: ZoneMemory
+    action_dim: 14
+    state_dim: 28                                   # endpose(14) + joint(12) + gripper(2)
+    action_horizon: 50
+    action_hidden_dim: 2560                        # overwritten by VLM hidden_size
+    hidden_size: 512
+    N_act: 4                                        # must match qwenzone.N_act
+    N_vis_tokens: 8
+    N_state_tokens: 4
+    N_stereo: 8                                    # stereo tokens per step (0 = disable)
+    stereo_dim: 512                                # input dim from StereoEncoder
+    nhead: 8
+    num_transformer_layers: 4
+
+datasets:
+  vla_data:
+    dataset_py: robotwin_hdf5                         # HDF5 dataloader (bypasses LeRobot)
+    include_state: true
+    data_root_dir: /mnt/workspace/yama/RoboTwin/data
+    data_mix: click_bell                             # sub-directory name
+    T_obs: 4                                        # sequence time steps (passed to HDF5 dataset)
+    per_device_batch_size: 1                        # T=2, H=50, stereo → keep small
+    load_all_data_for_training: true
+    obs_image_size: [224, 224]
+    video_backend: torchvision_av
+    shuffle: true
+
+trainer:
+  max_train_steps: 500000
+  num_warmup_steps: 2000
+  save_interval: 5000
+  eval_interval: 99999999                              # chunk model: disable trainer MSE eval (assumes single-step); use sim eval instead
+  learning_rate:
+    base: 2.0e-05
+    qwen_vl_interface: 1.0e-05                     # VLM backbone: conservative lr
+    action_model: 1.0e-04                          # randomly-init action head: higher lr
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-07
+  freeze_modules: ''
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

@@ -8,6 +8,6 @@ instruction_type: unseen
 # StarVLA Client Parameters
 host: "127.0.0.1"
 port: 5694
-unnorm_key: "new_embodiment"
+unnorm_key: "robotwin_qwenzone"
 action_mode: "abs"
 normalization_mode: "min_max"  # options: min_max, q99

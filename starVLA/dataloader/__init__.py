@@ -60,8 +60,25 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
         return vla_train_dataloader
+    elif dataset_py == "robotwin_hdf5":
+        from starVLA.dataloader.lerobot_datasets import collate_fn
+        from starVLA.dataloader.gr00t_lerobot.hdf5_robotwin_dataset import HDF5RobotwinDataset
+
+        vla_cfg = cfg.datasets.vla_data
+        T = int(vla_cfg.get("T_obs", 2))
+        H = int(vla_cfg.get("action_horizon", 50))
+        ds = HDF5RobotwinDataset(Path(vla_cfg.data_root_dir) / vla_cfg.data_mix, T=T, H=H)
+        train_dataloader = DataLoader(
+            ds,
+            batch_size=vla_cfg.per_device_batch_size,
+            collate_fn=collate_fn,
+            num_workers=0,
+            shuffle=True,
+        )
+        return train_dataloader
+
     elif dataset_py == "vlm_datasets":
         vlm_data_module = make_vlm_dataloader(cfg)
         vlm_train_dataloader = vlm_data_module["train_dataloader"]
-        
+
         return vlm_train_dataloader

@@ -115,7 +115,7 @@ class ModelClient:
         images = [self._resize_image(image) for image in images]
         example["image"] = images
         example_copy = example.copy()
-        example_copy.pop("state")
+        # NOTE: state is kept (not popped) — QwenZone action head needs proprioception.
         vla_input = {
             "examples": [example_copy],
             "do_sample": False,
@@ -128,6 +128,8 @@ class ModelClient:
 
         if step % action_chunk_size == 0 or self.raw_actions is None:
             response = self.client.predict_action(vla_input)
+            if isinstance(response, str) or (isinstance(response, dict) and "error" in response):
+                raise RuntimeError(f"server inference error: {response}")
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
 
@@ -202,19 +204,29 @@ def eval(TASK_ENV, model, observation):
     # Get instruction
     instruction = TASK_ENV.get_instruction()
 
-    # Prepare images
-    head_img = observation["observation"]["head_camera"]["rgb"]
-    left_img = observation["observation"]["left_camera"]["rgb"]
-    right_img = observation["observation"]["right_camera"]["rgb"]
+    # Prepare images — QwenZone: VLM sees head_camera_left (single cam),
+    # stereo encoder consumes head_camera_left + head_camera_right pair.
+    obs_cam = observation["observation"]
+    head_left = obs_cam.get("head_camera_left", obs_cam.get("head_camera"))["rgb"]
+    head_right = obs_cam.get("head_camera_right", head_left)["rgb"]
 
-    # Order: [head, left, right] to match training order
-    images = [head_img, left_img, right_img]
-
-    state = observation["joint_action"]["vector"]
+    # state: endpose(7+7) + joint(6+6) + gripper(1+1) = 28 (matches training)
+    endp = observation["endpose"]
+    joint = observation["joint_action"]
+    state = np.concatenate([
+        np.asarray(endp["left_endpose"], dtype=np.float32),
+        np.asarray(endp["right_endpose"], dtype=np.float32),
+        np.asarray(joint["left_arm"], dtype=np.float32),
+        np.asarray(joint["right_arm"], dtype=np.float32),
+        np.array([joint["left_gripper"]], dtype=np.float32),
+        np.array([joint["right_gripper"]], dtype=np.float32),
+    ])
     example = {
         "lang": str(instruction),
-        "image": images,
-        "state": state,  # Required for delta/rel action modes
+        "image": [head_left],                              # VLM single camera
+        "state": state,                                    # proprioception for action head
+        "stereo_left": [cv.resize(head_left, (512, 256))],
+        "stereo_right": [cv.resize(head_right, (512, 256))],
     }
 
     action = model.step(example, step=TASK_ENV.take_action_cnt)

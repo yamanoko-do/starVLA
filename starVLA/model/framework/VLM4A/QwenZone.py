@@ -1,492 +1,507 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License");
-# Implemented by [Junqiu YU / Fudan University] in [2025].
-# Design and Merged by [Jinhui YE / HKUST University] in [2025].
-"""
-Qwen-Zone Framework
-A lightweight implementation that Qwen-VL + Flow-matching head to directly predict continuous actions.
-Zone variant: temporally-aware multi-frame video input with configurable timestamp strategies.
-Flow-matching header is copyright from GR00T N1.5,
-"""
 
-import re
-import sys
-from pathlib import Path
+"""
+QwenZone Framework — memory-token VLA with block-wise attention (Phase 1).
 
-# Add workspace root to Python path if not already there
-_workspace_root = Path(__file__).parent.parent.parent.parent.parent
-if str(_workspace_root) not in sys.path:
-    sys.path.insert(0, str(_workspace_root))
+Design (see tt.md): introduce history via memory tokens so the model can distinguish
+identical-looking observations that require different future actions, and decouple
+"action intent" (encoded by VLM) from "action execution" (action head).
+
+Sequence per sample (T timesteps):
+    S = [M_init, V_0, L, A_0, M_0, V_1, A_1, M_1, ..., V_{T-1}, A_{T-1}, M_{T-1}]
+  - M_init : N_mem memory-init tokens (emoji 🌱) at the head
+  - V_t    : vision tokens of step t (3 cameras)
+  - L      : language tokens
+  - A_t    : N_act action-intent tokens (emoji 🔍), no supervision (driven by action loss)
+  - M_t    : N_mem memory tokens (emoji 🧠), the only cross-step information channel
+
+Attention is block-wise (see block_attention.py): bidirectional within a timestep block,
+controlled across timesteps (history flows only through Memory). Implemented as a custom
+4D additive mask fed to Qwen3-VL (transformers 4.57.0 supports custom 4D masks natively).
+
+Action head (ZoneMemoryActionHead): non-autoregressive, predicts an H=50 step action chunk
+at each timestep from h(A_t) + V_t + state, where:
+  - h(A_t): action-intent from VLM last hidden (high-level, slow VLM forward)
+  - V_t: raw vision features from ViT→Perceiver (fine-grained, pre-LLM, high-frequency candidate)
+  - state: proprioception.
+Decoupling V_t (raw vision) from the VLM LLM layers is intentional: the action head is meant
+to combine coarse intent with fine-grained, real-time visual observations.
+
+Phase 1 scope: single-pass forward + full-history inference. (Pass2/RNN/async delay = Phase 2.)
+"""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
-from transformers.video_utils import VideoMetadata
 
 from deployment.model_server.tools.image_tools import to_pil_preserve
+from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
 
-# HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
-IGNORE_INDEX = -100
+IMAGE_TOKEN_INDEX = 151655  # <image> placeholder id (aligned with QWen3.py)
 
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config
-from starVLA.model.modules.action_model.Zone_ActionHeader import ZoneActionHeadTransformer, get_action_model
+from starVLA.model.framework.VLM4A.block_attention import build_block_attention_mask
+from starVLA.model.modules.action_model.ZoneMemory_ActionHeader import get_action_model
+from starVLA.model.modules.action_model.StereoEncoder import StereoEncoder
 from starVLA.model.modules.vlm import get_vlm_model
-from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 
+def gather_token_hidden(last_hidden, input_ids, token_id, expected_count):
+    """Gather the hidden states at positions where input_ids == token_id, in position order.
+
+    last_hidden: [B, L, H]; input_ids: [B, L].
+    Returns [B, expected_count, H]. Raises if any sample has fewer matches than expected.
+    """
+    B, L, H = last_hidden.shape
+    mask = input_ids == token_id  # [B, L]
+    counts = mask.sum(dim=1)
+    if int(counts.min()) < expected_count:
+        raise RuntimeError(
+            f"gather_token_hidden(token={token_id}): need {expected_count} per sample, "
+            f"got min={int(counts.min())}"
+        )
+    idx = torch.arange(L, device=last_hidden.device).unsqueeze(0).expand(B, L)
+    masked_pos = torch.where(mask, idx, torch.full_like(idx, L))  # non-matches -> L (large)
+    topk_pos = masked_pos.topk(k=expected_count, dim=-1, largest=False).values  # [B, k]
+    topk_pos = topk_pos.sort(dim=-1).values
+    expanded = topk_pos.unsqueeze(-1).expand(-1, -1, H)
+    return last_hidden.gather(1, expanded)
+
+
 # ──────────────────────────────────────────────────────────────────────
-#  Default Config for QwenZone
-#  - Documents every framework-level parameter with type + description
-#  - YAML values override these defaults; extra YAML keys are preserved
+#  Default Config
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class QwenZoneDefaultConfig:
-    """QwenZone framework default parameters.
-
-    All fields can be overridden by the corresponding key in the YAML
-    ``framework:`` section.  Extra YAML keys not listed here are kept
-    as-is (Config-as-API flexibility).
-    """
-
-    # --- Registry identifier ---
     name: str = "QwenZone"
 
-    # === VLM backbone (Qwen2.5-VL / Qwen3-VL) ===
     qwenvl: dict = field(
         default_factory=lambda: {
-            # Path to base VLM checkpoint (local or HF hub id)
-            "base_vlm": "./playground/Pretrained_models/Qwen3-VL-4B-Instruct",
-            # Attention implementation: "flash_attention_2" | "eager" | "sdpa"
-            "attn_implementation": "flash_attention_2",
-            # VLM hidden dimension (used for cross-attention alignment)
-            "vl_hidden_dim": 2048,
+            "base_vlm": "./playground/Pretrained_models/Qwen3-VL-4B-Instruct-MemoryAction",
+            "attn_implementation": "sdpa",  # 4D additive mask requires sdpa (not flash)
         }
     )
 
-    # === Video / multi-frame input ===
-    video: dict = field(
+    qwenzone: dict = field(
         default_factory=lambda: {
-            # Whether to treat multi-frame image lists as video (<video> token)
-            # instead of independent <image> tokens. Requires Qwen3-VL / Qwen3.5-VL.
-            "use_video_token": True,
-            # Invert timestamps: count down from end instead of up from start
-            "invert_timestamps": False,
-            # Video fps (used when examples don't carry per-sample fps)
-            "fps": 30.0,
-            # Prevent processor from internally resampling pre-sampled frames
-            "do_sample_frames": False,
+            "T_obs": 4,        # sequence time steps
+            "N_act": 8,        # action-intent tokens per step
+            "N_mem": 8,        # memory tokens per step (and for M_init)
+            "max_history": 16, # inference: cap history length
         }
     )
 
-    # === Action head (Flow-matching / DiT diffusion) ===
     action_model: dict = field(
         default_factory=lambda: {
-            # DiT model size: "DiT-B" | "DiT-L" | "DiT-XL"
-            "action_model_type": "DiT-B",
-            # Hidden dim for action model (auto-aligned at runtime)
-            "action_hidden_dim": 1024,
-            "hidden_size": 1024,
-            # Whether to add positional embeddings in the action head
-            "add_pos_embed": True,
-            "max_seq_len": 1024,
-            # Dimensionality of each action vector (e.g., 7 for 6-DoF + gripper)
-            "action_dim": 7,
-            # State dimension (proprioception input)
-            "state_dim": 7,
-            # Canonical chunk length (number of action steps the head predicts).
-            # Legacy YAMLs may use future_action_window_size = action_horizon - 1;
-            # apply_config_compat normalises both directions.
-            "action_horizon": 8,
-            # Repeat factor for flow-matching loss (more noise samples per batch)
-            "repeated_diffusion_steps": 8,
-            # Beta distribution params for noise schedule
-            "noise_beta_alpha": 1.5,
-            "noise_beta_beta": 1.0,
-            "noise_s": 0.999,
-            "num_timestep_buckets": 1000,
-            # Inference denoising steps
-            "num_inference_timesteps": 4,
-            # Number of vision tokens fed to action head
-            "num_target_vision_tokens": 32,
-            # === DiT Transformer sub-config ===
-            "diffusion_model_cfg": {
-                # Cross-attention dim (aligned to VLM hidden_size at runtime)
-                "cross_attention_dim": 2048,
-                "dropout": 0.2,
-                "final_dropout": True,
-                "interleave_self_attention": True,
-                "norm_type": "ada_norm",
-                "num_layers": 16,
-                "output_dim": 1024,
-                "positional_embeddings": None,
-            },
+            "action_model_type": "ZoneMemory",
+            "action_dim": 14,
+            "state_dim": 14,
+            "action_horizon": 50,
+            "action_hidden_dim": 2560,  # overwritten by VLM hidden_size at runtime
+            "hidden_size": 512,
+            "N_act": 8,
+            "N_vis_tokens": 8,
+            "N_state_tokens": 4,
+            "nhead": 8,
+            "num_transformer_layers": 4,
         }
     )
 
 
 @FRAMEWORK_REGISTRY.register("QwenZone")
-class Qwen_Zone(baseframework):
-    """
-    Multimodal vision-language-action model (Zone variant — temporally-aware).
+class Qwenvl_Zone(baseframework):
+    """QwenZone memory-token VLA (Phase 1)."""
 
-    Components:
-      - Qwen2.5-VL / Qwen3-VL backbone for fused language/vision token embeddings
-      - Flow-matching (DiT) diffusion head for continuous action sequence modeling
-
-    Focus: Predict future continuous actions conditioned on multi-frame video + instruction.
-    Supports configurable timestamp strategies via monkey-patched processor.
-    """
-
-    def __init__(
-        self,
-        config: Optional[dict] = None,
-        **kwargs,
-    ) -> None:
-        """
-        Construct all submodules and cache key configuration values.
-
-        Args:
-            config: Hierarchical configuration (OmegaConf/dict) containing framework + trainer sections.
-            **kwargs: Reserved for future overrides (unused).
-        """
+    def __init__(self, config: Optional[dict] = None, **kwargs) -> None:
         super().__init__()
-        # Merge framework defaults with YAML config (YAML wins on conflicts)
         self.config = merge_framework_config(QwenZoneDefaultConfig, config)
+
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        self.processor = self.qwen_vl_interface.processor
+        hidden_size = self.qwen_vl_interface.model.config.hidden_size
+        self.config.framework.action_model.action_hidden_dim = hidden_size
 
-        self.action_model: ZoneActionHeadTransformer = get_action_model(config=self.config)
+        self.action_model = get_action_model(config=self.config)
 
-        # `action_horizon` is the single source of truth for chunk length.
+        qz = self.config.framework.qwenzone
+        self.T_obs = int(qz.T_obs)
+        self.N_act = int(qz.N_act)
+        self.N_mem = int(qz.N_mem)
+        self.max_history = int(qz.get("max_history", 16))
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
-        # --- hook up video-aware processor patches ---
-        self._video_cfg = self.config.framework.get("video", {})
-        self._use_video = self._video_cfg.get("use_video_token", False)
-        self._invert_ts = self._video_cfg.get("invert_timestamps", False)
-        self._default_fps = self._video_cfg.get("fps", 30.0)
-        self._do_sample = self._video_cfg.get("do_sample_frames", False)
-
-        if self._use_video:
-            self._install_processor_patches()
-
-    def _install_processor_patches(self):
-        """Monkey-patch the processor for accurate video timestamps and grid_thw."""
-        proc = self.qwen_vl_interface.processor
-        if not hasattr(proc, '_calculate_timestamps'):
-            return
-        _orig_calc_ts = proc._calculate_timestamps
-        invert = self._invert_ts
-
-        def _exact_ts(indices, video_fps, merge_size=2):
-            real_indices = getattr(proc, '_sample_indices', None)
-            real_fps = getattr(proc, '_real_fps', None)
-            if real_indices is not None and real_fps is not None:
-                # real_indices are offsets from current frame (e.g. [-21, -13, ..., 0]).
-                # Convert to positive "seconds ago":  0.0 = now, 0.42 = 0.42s ago.
-                frame_ts = [-real_indices[idx] / real_fps for idx in indices]
-            else:
-                frame_ts = [idx / video_fps for idx in indices]
-            return [(frame_ts[i] + frame_ts[i + merge_size - 1]) / 2
-                    for i in range(0, len(frame_ts), merge_size)]
-
-        proc._calculate_timestamps = _exact_ts
-
-    # ── helper: detect whether input is multi-frame video ──────────────
-
-    @staticmethod
-    def _is_video_input(imgs):
-        """imgs is one sample's image list.  True when first element is itself a list of frames."""
-        return len(imgs) > 0 and isinstance(imgs[0], (list, tuple))
-
-    # ── video-aware input builder (replaces build_qwenvl_inputs for video) ──
-
-    def _build_zone_inputs(self, images, instructions, solutions=None,
-                           fps_list=None, sample_indices_list=None):
-        """
-        Build processor inputs, routing to <video> tokens when input is multi-frame.
-
-        Args:
-            images:  List[List[PIL.Image]] — B samples, each a flat image list (image mode)
-                     or List[List[List[PIL.Image]]] — B samples, each a camera×frames list (video mode)
-            instructions:  List[str]
-            solutions:  Optional[List[str]]
-            fps_list:  Optional[List[float]] — per-sample fps for video mode
-            sample_indices_list:  Optional[List[List[int]]] — per-sample frame indices (for exact timestamps)
-
-        Returns:
-            BatchFeature dict on the correct device.
-        """
-        if any(self._is_video_input(imgs) for imgs in images):
-            return self._build_video_inputs(
-                images, instructions, solutions, fps_list, sample_indices_list)
-        # fallback to original image-only path
-        return self.qwen_vl_interface.build_qwenvl_inputs(
-            images=images, instructions=instructions, solutions=solutions)
-
-    def _build_video_inputs(self, images, instructions, solutions=None,
-                            fps_list=None, sample_indices_list=None):
-        """Build inputs with <video> tokens — one <video> block per camera."""
-        proc = self.qwen_vl_interface.processor
-        has_solutions = solutions is not None
-
-        default_fps = self._default_fps
-        messages = []
-        for b in range(len(images)):
-            imgs = images[b]
-            instruction = instructions[b]
-            per_cam_frames = imgs if self._is_video_input(imgs) else [imgs]
-            n_frames = len(per_cam_frames[0]) if per_cam_frames else 0
-            fps = fps_list[b] if fps_list else default_fps
-
-            # Store for monkey-patched _calculate_timestamps
-            if sample_indices_list and b < len(sample_indices_list):
-                proc._sample_indices = sample_indices_list[b]
-            else:
-                proc._sample_indices = list(range(n_frames))
-            proc._real_fps = fps
-
-            duration = n_frames / fps if fps > 0 else 0
-            effective_fps = n_frames / duration if duration > 0 else fps
-
-            content = []
-            for cam_frames in per_cam_frames:
-                nf = len(cam_frames) if isinstance(cam_frames, (list, tuple)) else 1
-                meta = VideoMetadata(
-                    total_num_frames=nf,
-                    fps=effective_fps,
-                    frames_indices=list(range(nf)),
-                )
-                content.append({
-                    "type": "video",
-                    "video": cam_frames,
-                    "fps": effective_fps,
-                })
-                # Attach metadata to last video entry for processor
-                content[-1]["video_metadata"] = meta
-
-            if "CoT_prompt" in self.config.datasets.vla_data:
-                CoT_prompt = self.config.datasets.vla_data.get("CoT_prompt", "")
-                prompt = CoT_prompt.replace("{instruction}", instruction)
-            else:
-                prompt = instruction
-            content.append({"type": "text", "text": prompt})
-
-            msg = [{"role": "user", "content": content}]
-            if has_solutions:
-                msg.append({"role": "assistant", "content": [{"type": "text", "text": solutions[b]}]})
-            messages.append(msg)
-
-        # Build with processor
-        video_metadata_flat = []
-        for msg in messages:
-            for item in msg[0]["content"]:
-                if isinstance(item, dict) and item.get("type") == "video":
-                    vm = item.pop("video_metadata", None)
-                    if vm:
-                        video_metadata_flat.append(vm)
-
-        batch_inputs = proc.apply_chat_template(
-            messages, tokenize=True, padding=True,
-            add_generation_prompt=True, return_dict=True, return_tensors="pt",
-            do_sample_frames=self._do_sample,
-            video_metadata=video_metadata_flat if video_metadata_flat else None,
+        # consistency: sequence N_act must equal action head N_act
+        assert int(self.config.framework.action_model.get("N_act", self.N_act)) == self.N_act, (
+            "qwenzone.N_act must equal action_model.N_act"
         )
 
-        # Fix: split video_grid_thw so each temporal chunk has its own row
-        if "video_grid_thw" in batch_inputs:
-            vg = batch_inputs["video_grid_thw"]
-            new_rows = []
-            for row in vg:
-                T = int(row[0].item())
-                for _ in range(T):
-                    new_rows.append([1, int(row[1].item()), int(row[2].item())])
-            batch_inputs["video_grid_thw"] = torch.tensor(
-                new_rows, dtype=vg.dtype, device=vg.device)
+        tok = self.processor.tokenizer
+        self.action_token_id = self._single_token_id(tok, "🔍")
+        self.memory_token_id = self._single_token_id(tok, "🧠")
+        self.memory_init_id = self._single_token_id(tok, "🌱")
+        self.image_token_id = IMAGE_TOKEN_INDEX
+        self.pad_token_id = tok.pad_token_id
 
-        # Label masking (same logic as build_qwenvl_inputs)
-        if has_solutions:
-            action_token_min = 248077
-            action_token_max = 248077 + 2047
-            labels = batch_inputs["input_ids"].clone()
-            for i in range(labels.size(0)):
-                seq = labels[i]
-                mask_seq = (seq >= action_token_min) & (seq <= action_token_max)
-                nonzero = torch.nonzero(mask_seq, as_tuple=False)
-                if nonzero.numel() > 0:
-                    seq[:nonzero[0].item()] = -100
-                else:
-                    seq[:] = -100
-            labels[labels == proc.tokenizer.pad_token_id] = -100
-            batch_inputs["labels"] = labels
+        # --- frozen stereo encoder (optional) ---
+        stereo_cfg = qz.get("stereo", {}) or {}
+        if stereo_cfg.get("ckpt_path"):
+            from starVLA.model.modules.action_model.StereoEncoder import StereoEncoder
+            self.stereo_encoder = StereoEncoder(
+                ckpt_path=stereo_cfg["ckpt_path"],
+                update_iters=int(stereo_cfg.get("update_iters", 4)),
+                pool_size=int(stereo_cfg.get("pool_size", 8)),
+                hidden_dim=int(self.config.framework.action_model.get("hidden_size", 512)),
+                N_stereo_tokens=int(stereo_cfg.get("N_stereo_tokens", 8)),
+            )
+        else:
+            self.stereo_encoder = None
 
-        return batch_inputs.to(self.qwen_vl_interface.model.device)
+        self.l1_loss = nn.L1Loss()
+        self._infer_history: Optional[List[dict]] = None
 
-    def forward(
-        self,
-        examples: List[dict] = None,
-        **kwargs,
-    ) -> Tuple:
-        """ """
-        batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"] for example in examples]  # label [B， len, 7]
-        fps_list = [example.get("fps", self._default_fps) for example in examples]
-        sample_indices_list = [example.get("sample_indices", None) for example in examples]
+    @staticmethod
+    def _single_token_id(tokenizer, emoji):
+        ids = tokenizer(emoji, add_special_tokens=False)["input_ids"]
+        assert len(ids) == 1, f"emoji {emoji} must be a single token, got {ids}"
+        return ids[0]
 
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+    # ── sequence construction ──────────────────────────────────────────
+    def _build_sequence(self, example, images_by_cam):
+        """Build input_ids + token_meta + image tensors for one sample.
 
-        # Step 1: QWenVL input format (auto-detects image vs video)
-        qwen_inputs = self._build_zone_inputs(
-            images=batch_images, instructions=instructions,
-            fps_list=fps_list, sample_indices_list=sample_indices_list)
-        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+        images_by_cam: [num_cam][T] PIL images (cam-major, time-minor).
+        Returns dict with input_ids (list[int]), token_meta (list[(type,step)]),
+        pixel_values, image_grid_thw.
+        """
+        tok = self.processor.tokenizer
+        num_cam = len(images_by_cam)
+        T = len(images_by_cam[0])
+
+        # flatten images as [s0_c0, s0_c1, ..., s0_c{C-1}, s1_c0, ...] (time-major, cam-minor)
+        flat_images = [images_by_cam[c][t] for t in range(T) for c in range(num_cam)]
+
+        img_inputs = self.processor.image_processor(images=flat_images, return_tensors="pt")
+        pixel_values = img_inputs["pixel_values"]
+        image_grid_thw = img_inputs["image_grid_thw"]
+        per_image_tokens = (image_grid_thw.prod(dim=-1) // 4).tolist()
+        # assume all images share the same resolution (RoboTwin 224x224)
+        assert len(set(per_image_tokens)) == 1, (
+            f"QwenZone expects uniform image resolution, got token counts {per_image_tokens}"
+        )
+        self._per_image_tokens = per_image_tokens[0]
+
+        L_ids = tok(example["lang"], add_special_tokens=False)["input_ids"]
+
+        input_ids = []
+        token_meta = []  # (type, step)
+        # M_init at the head (step -1)
+        input_ids += [self.memory_init_id] * self.N_mem
+        token_meta += [("M_init", -1)] * self.N_mem
+
+        img_idx = 0
+        for t in range(T):
+            for _c in range(num_cam):
+                n = per_image_tokens[img_idx]
+                input_ids += [self.image_token_id] * n
+                token_meta += [("V", t)] * n
+                img_idx += 1
+            if t == 0:
+                input_ids += L_ids
+                token_meta += [("L", 0)] * len(L_ids)
+            input_ids += [self.action_token_id] * self.N_act
+            token_meta += [("A", t)] * self.N_act
+            input_ids += [self.memory_token_id] * self.N_mem
+            token_meta += [("M", t)] * self.N_mem
+
+        assert img_idx == len(flat_images), "image token block count mismatch"
+
+        return {
+            "input_ids": input_ids,
+            "token_meta": token_meta,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "num_cam": num_cam,
+        }
+
+    def _assemble_batch(self, seqs, device):
+        """Left-pad input_ids to common length and stack a 4D block attention mask."""
+        Lmax = max(len(s["input_ids"]) for s in seqs)
+        neg = torch.finfo(torch.bfloat16).min
+
+        ids_batch = []
+        attn_list = []
+        for s in seqs:
+            Li = len(s["input_ids"])
+            pad_len = Lmax - Li
+            ids_padded = [self.pad_token_id] * pad_len + s["input_ids"]
+            ids_batch.append(ids_padded)
+
+            types = [m[0] for m in s["token_meta"]]
+            steps = [m[1] for m in s["token_meta"]]
+            m_i = build_block_attention_mask(types, steps, dtype=torch.bfloat16, device=device)  # [Li, Li]
+            full = torch.full((Lmax, Lmax), neg, dtype=torch.bfloat16, device=device)
+            full[pad_len:, pad_len:] = m_i  # real tokens block at bottom-right; pad rows/cols stay masked
+            attn_list.append(full)
+
+        input_ids = torch.tensor(ids_batch, dtype=torch.long, device=device)  # [B, Lmax]
+        attn_4d = torch.stack(attn_list, dim=0).unsqueeze(1)  # [B, 1, Lmax, Lmax]
+
+        pixel_values = torch.cat([s["pixel_values"] for s in seqs], dim=0).to(device)
+        image_grid_thw = torch.cat([s["image_grid_thw"] for s in seqs], dim=0).to(device)
+        return input_ids, attn_4d, pixel_values, image_grid_thw, Lmax
+
+    def _gather_hA(self, last_hidden, input_ids, T):
+        """Gather action-intent hidden states from VLM last layer, reshaped per timestep."""
+        B = last_hidden.shape[0]
+        H = last_hidden.shape[-1]
+        h_A = gather_token_hidden(last_hidden, input_ids, self.action_token_id, T * self.N_act)
+        return h_A.reshape(B, T, self.N_act, H)
+
+    def _split_raw_vis_by_step(self, raw_vis, image_grid_thw, B, T, num_cam):
+        """Split raw vision-encoder features (pre-LLM, ViT→Perceiver output) into [B,T,N_v,H].
+
+        raw_vis: [total_tokens, H] from model.visual(), concatenated per-image across batch.
+        image_grid_thw: [B*num_cam*T, 3] in flat_images order [s0_c0, s0_c1, ..., s0_c{C-1}, s1_c0, ...].
+        """
+        per_img_tokens = (image_grid_thw.prod(dim=-1) // 4).tolist()
+        raw_per_img = list(raw_vis.split(per_img_tokens, dim=0))  # list of [n_i, H]
+
+        idx = 0
+        batch_feats = []
+        for _b in range(B):
+            step_feats = []
+            for _t in range(T):
+                step_parts = [raw_per_img[idx + c] for c in range(num_cam)]
+                step_feats.append(torch.cat(step_parts, dim=0))
+                idx += num_cam
+            batch_feats.append(torch.stack(step_feats, dim=0))
+        return torch.stack(batch_feats, dim=0)  # [B, T, N_v, H]
+
+    def _extract_stereo(self, examples, device):
+        """Run frozen stereo encoder on left/right image pairs per timestep.
+
+        Each example is expected to carry ``stereo_left`` / ``stereo_right`` keys,
+        each a list of T PIL images. Returns [B, T, N_stereo, hidden_dim].
+        Falls back to a zero-filled tensor if no stereo images are provided
+        (for backward compatibility with non-stereo configs).
+        """
+        if self.stereo_encoder is None:
+            return None
+
+        # determine T from the data (may differ between training and inference)
+        B = len(examples)
+        has_stereo = all("stereo_left" in ex and "stereo_right" in ex for ex in examples)
+        if not has_stereo:
+            return None
+
+        # collect all stereo pairs across batch & timestep, then forward in one go
+        all_left, all_right = [], []
+        T = len(examples[0]["stereo_left"])
+        for ex in examples:
+            for t in range(T):
+                all_left.append(ex["stereo_left"][t])
+                all_right.append(ex["stereo_right"][t])
+
+        # PIL → ImageNet-normalised tensor
+        left_t = torch.stack([self._pil_to_imagenet(im) for im in all_left]).to(device)
+        right_t = torch.stack([self._pil_to_imagenet(im) for im in all_right]).to(device)
+
+        stereo_tokens = self.stereo_encoder(left_t, right_t)  # [B*T, N_stereo, hd]
+        return stereo_tokens.reshape(B, T, *stereo_tokens.shape[1:])
+
+    @staticmethod
+    def _pil_to_imagenet(pil_img):
+        """Convert a PIL image to an ImageNet-normalised tensor [3, H, W]."""
+        import torchvision.transforms.functional as TF
+        t = TF.to_tensor(pil_img)  # [0,1] range
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        return (t - mean) / std
+
+    # ── training forward ───────────────────────────────────────────────
+    def forward(self, examples: List[dict], **kwargs):
+        device = next(self.qwen_vl_interface.parameters()).device
+        T = self.T_obs
+        H = self.action_horizon
+
+        seqs = []
+        for ex in examples:
+            images_by_cam = [[to_pil_preserve(im) for im in cam_frames] for cam_frames in ex["image"]]
+            seqs.append(self._build_sequence(ex, images_by_cam))
+
+        input_ids, attn_4d, pixel_values, image_grid_thw, Lmax = self._assemble_batch(seqs, device)
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
+            # V_t: raw vision encoder output (ViT→Perceiver, pre-LLM) — fine-grained, high-frequency
+            raw_vis = self.qwen_vl_interface.model.visual(pixel_values, grid_thw=image_grid_thw)[0]
+            # VLM forward — encodes action intent h(A_t) via block-wise attention
+            outputs = self.qwen_vl_interface(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attn_4d,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
+            last_hidden = outputs.hidden_states[-1]  # [B, Lmax, H]
 
-        # Step 4: Action Head (MLP — no diffusion)
         with torch.autocast("cuda", dtype=torch.float32):
-            actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
-            )
-            actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+            h_A = self._gather_hA(last_hidden, input_ids, T)   # [B,T,N_act,H] — action intent
+            num_cam = seqs[0].get("num_cam", 3)
+            h_V = self._split_raw_vis_by_step(raw_vis, image_grid_thw, len(examples), T, num_cam)
 
-            state_tensor = None
-            if state is not None:
-                state_tensor = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)  # [B, 1, D]
-                # Tile current state to pseudo-history (until dataloader provides real history)
-                state_tensor = state_tensor.repeat(1, self.action_model.state_history_len, 1)  # [B, 50, D]
-
-            action_loss = self.action_model(
-                last_hidden, actions_target, state_tensor,
-                encoder_attention_mask=backbone_attention_mask,
+            # state: [B, T, state_dim]
+            state = torch.tensor(
+                np.stack([np.asarray(ex["state"], dtype=np.float32) for ex in examples]),
+                device=device,
             )
+            # action chunks: each ex action [T+H-1, dim] -> [T, H, dim]
+            chunks = []
+            for ex in examples:
+                act = np.asarray(ex["action"], dtype=np.float32)
+                chunk = np.stack([act[t : t + H] for t in range(T)], axis=0)  # [T, H, dim]
+                chunks.append(chunk)
+            actions_target = torch.tensor(np.stack(chunks), device=device)  # [B, T, H, dim]
+
+            stereo_tokens = self._extract_stereo(examples, device)
+            action_loss = self.action_model(h_A, h_V, state, actions_target, stereo=stereo_tokens)
 
         return {"action_loss": action_loss}
 
+    # ── inference (full-history mode) ──────────────────────────────────
+    def reset_history(self):
+        self._infer_history = None
+
     @torch.inference_mode()
-    def predict_action(
-        self,
-        examples: List[dict],
-        **kwargs: str,
-    ) -> np.ndarray:
+    def predict_action(self, examples, **kwargs):
+        """Full-history inference. Each example carries the CURRENT step observation
+        (image: [num_cam PIL], state: [state_dim]); we accumulate history internally and
+        forward the whole sequence, returning the current step's H-step chunk.
         """
-        Steps:
-          1. Resize images to training resolution (if specified)
-          2. Encode with QwenVL (hidden states retained)
-          6. Return normalized action trajectory
-        Returns:
-            dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
-        """
-        if type(examples) is not list:
+        if not isinstance(examples, list):
             examples = [examples]
-        batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        fps_list = [example.get("fps", self._default_fps) for example in examples]
-        sample_indices_list = [example.get("sample_indices", None) for example in examples]
 
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        # Reset history when the task changes (new episode) so server-side history
+        # doesn't leak across episodes.
+        cur_lang = examples[0].get("lang", "") if examples else ""
+        if self._infer_history is None or getattr(self, "_last_lang", None) != cur_lang:
+            self._infer_history = [{"imgs": [], "states": []} for _ in examples]
+            self._last_lang = cur_lang
+        for i, ex in enumerate(examples):
+            cur_imgs = [to_pil_preserve(im) for im in ex["image"]]  # [num_cam] current step
+            self._infer_history[i]["imgs"].append(cur_imgs)
+            self._infer_history[i]["states"].append(np.asarray(ex["state"], dtype=np.float32))
+            if len(self._infer_history[i]["imgs"]) > self.max_history:
+                self._infer_history[i]["imgs"] = self._infer_history[i]["imgs"][-self.max_history :]
+                self._infer_history[i]["states"] = self._infer_history[i]["states"][-self.max_history :]
 
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
-        if train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+        device = next(self.qwen_vl_interface.parameters()).device
+        T = len(self._infer_history[0]["imgs"])
 
-        # Step 1: QWenVL input format (auto-detects image vs video)
-        qwen_inputs = self._build_zone_inputs(
-            images=batch_images, instructions=instructions,
-            fps_list=fps_list, sample_indices_list=sample_indices_list)
-        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-        if backbone_attention_mask is not None:
-            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
+        # build history-augmented examples (cam-major, time-minor) [num_cam][T]
+        hist_examples = []
+        hist_states = []
+        for i, ex in enumerate(examples):
+            h = self._infer_history[i]
+            images_by_cam = [[h["imgs"][t][c] for t in range(T)] for c in range(len(h["imgs"][0]))]
+            hist_examples.append({"image": images_by_cam, "lang": ex["lang"]})
+            hist_states.append(np.stack(h["states"]))  # [T, state_dim]
+
+        seqs = [self._build_sequence(he, he["image"]) for he in hist_examples]
+        input_ids, attn_4d, pixel_values, image_grid_thw, Lmax = self._assemble_batch(seqs, device)
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
+            # V_t: raw vision encoder output (ViT→Perceiver, pre-LLM) — fine-grained, high-frequency
+            raw_vis = self.qwen_vl_interface.model.visual(pixel_values, grid_thw=image_grid_thw)[0]
+            # VLM forward — encodes action intent
+            outputs = self.qwen_vl_interface(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attn_4d,
                 output_hidden_states=True,
                 return_dict=True,
             )
+            last_hidden = outputs.hidden_states[-1]
 
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
-
-        state = (
-            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
-            if state is not None
-            else None
-        )
-        if state is not None and state.dim() == 3 and state.shape[1] == 1:
-            state = state.repeat(1, self.action_model.state_history_len, 1)  # [B, 1, D] → [B, 50, D]
-
-        # Step 4: Action Head (transformer, one-shot)
         with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(
-                last_hidden, state=state, encoder_attention_mask=backbone_attention_mask
-            )  # (B, action_horizon, action_dim)
+            h_A = self._gather_hA(last_hidden, input_ids, T)   # [B,T,N_act,H] — action intent
+            num_cam = seqs[0].get("num_cam", 3)
+            h_V = self._split_raw_vis_by_step(raw_vis, image_grid_thw, len(hist_examples), T, num_cam)
+            state = torch.tensor(np.stack(hist_states), device=device)  # [B, T, state_dim]
+            stereo_tokens = self._extract_stereo(hist_examples, device)
+            pred = self.action_model.predict_action(h_A, h_V, state, stereo=stereo_tokens)  # [B, T, H, dim]
 
-        normalized_actions = pred_actions.detach().cpu().numpy()
-        return {"normalized_actions": normalized_actions}
+        # return only the current (last) step's chunk
+        cur = pred[:, -1, :, :].detach().cpu().numpy()  # [B, H, dim]
+        return {"normalized_actions": cur}
 
 
 if __name__ == "__main__":
-    import argparse
-    import os
-
+    # tiny end-to-end test: forward + backward on random data (needs GPU + base ckpt)
     from omegaconf import OmegaConf
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config_yaml",
-        type=str,
-        default="examples/LIBERO/train_files/starvla_cotrain_libero.yaml",
-        help="Path to YAML config",
+    T, H_ACTION = 2, 50
+    ckpt = "/mnt/workspace/yama/starVLA/playground/Pretrained_models/Qwen3-VL-4B-Instruct-MemoryAction"
+    cfg = OmegaConf.create(
+        {
+            "framework": {
+                "name": "QwenZone",
+                "qwenvl": {"base_vlm": ckpt, "attn_implementation": "sdpa"},
+                "qwenzone": {"T_obs": T, "N_act": 4, "N_mem": 4, "max_history": 16},
+                "action_model": {
+                    "action_model_type": "ZoneMemory",
+                    "action_dim": 14,
+                    "state_dim": 14,
+                    "action_horizon": H_ACTION,
+                    "action_hidden_dim": 2560,
+                    "hidden_size": 512,
+                    "N_act": 4,
+                    "N_vis_tokens": 8,
+                    "N_state_tokens": 4,
+                    "nhead": 8,
+                    "num_transformer_layers": 4,
+                },
+            },
+            "datasets": {"vla_data": {"obs_image_size": [224, 224]}},
+        }
     )
-    args, clipargs = parser.parse_known_args()
 
-    if os.getenv("DEBUGPY_ENABLE", "0") == "1":
-        import debugpy
+    model = Qwenvl_Zone(cfg).cuda()
+    print(f"[init] hidden_size used by action head: {model.config.framework.action_model.action_hidden_dim}")
 
-        debugpy.listen(("0.0.0.0", 10092))
-        print("Rank 0 waiting for debugger attach on port 10092...")
-        debugpy.wait_for_client()
+    img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
 
-    cfg = OmegaConf.load(args.config_yaml)
+    def make_sample(lang):
+        return {
+            "action": np.random.uniform(-1, 1, (T + H_ACTION - 1, 14)).astype(np.float16),
+            "image": [[img] * T, [img] * T, [img] * T],  # [3 cam][T]
+            "lang": lang,
+            "state": np.random.uniform(-1, 1, (T, 14)).astype(np.float16),
+        }
 
-    model: Qwen_Zone = Qwen_Zone(cfg)
-    #print(model)
+    batch = [make_sample("pick up the red block"), make_sample("open the drawer")]
+    out = model(batch)
+    print(f"[forward] action_loss = {out['action_loss'].item():.4f}")
+    out["action_loss"].backward()
+    print("[backward] OK")
 
-    image = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
-    sample = {
-        "action": np.random.uniform(-1, 1, size=(16, 7)).astype(np.float16),
-        "image": [image],
-        "lang": "This is a fake instruction for testing.",
-    }
-    sample2 = sample.copy()
-    sample2["lang"] = "Another fake instruction for testing."
-
-    batch = [sample, sample2]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    forward_output = model(batch)
-    action_loss = forward_output["action_loss"]
-    print(f"Action Loss: {action_loss.item()}")
-
-    predict_output = model.predict_action(examples=[sample])
-    normalized_actions = predict_output["normalized_actions"]
-    print(f"Unnormalized Action: {normalized_actions}")
-
-    print("Finished")
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    losses = []
+    for step in range(5):
+        opt.zero_grad()
+        o = model(batch)
+        o["action_loss"].backward()
+        opt.step()
+        losses.append(o["action_loss"].item())
+    print(f"[train] losses over 5 steps: {[round(x, 4) for x in losses]}")
