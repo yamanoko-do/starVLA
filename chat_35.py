@@ -30,12 +30,39 @@ def _fib_offsets(n):
 
 MODEL_PATH = "/mnt/workspace/yama/oss_yama/cache/hf_cache/hub/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17"
 
+# Set to a trained Zone checkpoint to load VLM from it instead.
+# e.g. ZONE_CKPT = "playground/Checkpoints/foldclothes_zone/checkpoints/steps_80000_pytorch_model.pt"
+ZONE_CKPT = "playground/Checkpoints/foldclothes_zone_unfreezeVLM/checkpoints/steps_80000_pytorch_model.pt"
+
+
 print("Loading model...")
 t0 = time.time()
 model = Qwen3_5ForConditionalGeneration.from_pretrained(
     MODEL_PATH, attn_implementation="sdpa", torch_dtype=torch.bfloat16
 ).to("cuda")
 processor = AutoProcessor.from_pretrained(MODEL_PATH)
+
+if ZONE_CKPT is not None:
+    print(f"Loading VLM weights from Zone checkpoint: {ZONE_CKPT}")
+    ckpt = torch.load(ZONE_CKPT, map_location="cpu")
+    vlm_state = {}
+    # ckpt:  qwen_vl_interface.model.model.xxx  (QwenZone wraps Qwen3_5ForConditionalGeneration)
+    # model: model.xxx                          (raw Qwen3_5ForConditionalGeneration)
+    prefix = "qwen_vl_interface.model."
+    for k, v in ckpt.items():
+        if k.startswith(prefix):
+            vlm_state[k[len(prefix):]] = v
+    # strict=True would raise on mismatch; we use strict=False but check manually
+    model_state = model.state_dict()
+    matched = [k for k in vlm_state if k in model_state]
+    missing = [k for k in model_state if k not in vlm_state]
+    print(f"  Checkpoint VLM keys: {len(vlm_state)}")
+    print(f"  Matched & loaded:    {len(matched)}")
+    print(f"  Missing from ckpt:   {len(missing)} (model has but ckpt lacks)")
+    model.load_state_dict(vlm_state, strict=False)
+    if len(missing) > 0 and len(missing) < 10:
+        for k in missing:
+            print(f"    missing: {k}")
 # Monkey-patch _calculate_timestamps to use actual video frame indices
 # (needed for non-uniform sampling like Fibonacci). The processor calls
 # this with indices=[0..N-1] and effective_fps, but we override to compute

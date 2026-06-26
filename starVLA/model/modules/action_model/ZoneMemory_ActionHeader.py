@@ -1,20 +1,20 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License, Version 1.0 (the "License");
 
-"""ZoneMemory Action Head — Phase 1 transformer decoder for the QwenZone framework.
+"""ZoneMemory Action Head — transformer decoder for the QwenZone framework.
 
 Inputs (per timestep t, all timesteps processed in parallel by flattening T into batch):
   - h_A : [B, T, N_act, input_dim]   last-layer hidden states of the action-intent tokens A_t
-  - h_V : [B, T, N_v,   input_dim]   last-layer hidden states of the vision tokens V_t
-  - state : [B, T, state_dim]        proprioception
+  - h_V : [B, T, N_v,   input_dim]   RAW vision tokens V_t (NOT pooled — full spatial info kept)
+  - state : [B, T, state_dim]        proprioception (single-step per t, not historical)
+  - stereo: [B, T, N_stereo, hidden_dim]  fused stereo tokens (already at hidden_dim)
 
 Output:
   - [B, T, H_action, action_dim]      predicted future H_action-step action chunk per step,
                                       non-autoregressive (learnable query tokens, like OFT).
 
-Design: at each step a small bidirectional transformer runs over
-  [cmd_tokens(h_A), vis_tokens(pooled h_V), state_tokens(s_t), action_query]
-and the action_query positions are decoded into the action chunk.
+Sequence per step: [cmd(N_act) | vis(N_v raw) | state(N_state) | stereo(N_stereo) | query(H_action)]
+N_v is dynamic (depends on image resolution) → pos embedding uses a max-len buffer, sliced per call.
 """
 
 import torch
@@ -29,15 +29,14 @@ class ZoneMemoryActionHead(nn.Module):
         hidden_dim=512,
         action_dim=14,
         H_action=50,
-        N_act=8,
-        N_vis_tokens=8,
+        N_act=16,
         N_state_tokens=4,
-        N_stereo=0,            # 0 = no stereo; >0 = stereo tokens per step
-        stereo_dim=512,        # input dim of stereo tokens (already projected)
-        state_dim=14,
+        N_stereo=64,           # stereo tokens per step (0 = disable); already at hidden_dim
+        state_dim=28,
         nhead=8,
         num_layers=4,
         dropout=0.1,
+        pos_max_len=512,       # max sequence length for the positional-embedding buffer
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -45,17 +44,15 @@ class ZoneMemoryActionHead(nn.Module):
         self.action_dim = action_dim
         self.H_action = H_action
         self.N_act = N_act
-        self.N_vis_tokens = N_vis_tokens
         self.N_state_tokens = N_state_tokens
         self.N_stereo = N_stereo
 
-        # h_A (N_act tokens) -> command tokens (keep fine-grained intent, no pooling)
+        # h_A (N_act tokens) -> command tokens (intent, no pooling)
         self.cmd_proj = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
         )
-        # h_V (N_v tokens) -> pool to N_vis_tokens, then project
-        self.vis_pool = nn.AdaptiveAvgPool1d(N_vis_tokens)
+        # h_V (N_v tokens, RAW unpooled) -> project to hidden_dim
         self.vis_proj = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
@@ -65,22 +62,18 @@ class ZoneMemoryActionHead(nn.Module):
             nn.LayerNorm(state_dim),
             nn.Linear(state_dim, hidden_dim * N_state_tokens),
         )
-
-        # stereo tokens (already pooled+projected from StereoEncoder) -> optional fine-tune projection
+        # stereo tokens arrive already at hidden_dim (from StereoEncoder ResConv2)
+        # → no extra projection; optional LayerNorm for stability
         if N_stereo > 0:
-            self.stereo_proj = nn.Sequential(
-                nn.LayerNorm(stereo_dim),
-                nn.Linear(stereo_dim, hidden_dim),
-            )
+            self.stereo_norm = nn.LayerNorm(hidden_dim)
         else:
-            self.stereo_proj = None
+            self.stereo_norm = None
 
         # learnable action queries -> one-shot non-autoregressive prediction
         self.action_query = nn.Parameter(torch.randn(1, H_action, hidden_dim) * 0.02)
 
-        # per-step positional embedding over [cmd, vis, state, stereo?, query]
-        seq_len = N_act + N_vis_tokens + N_state_tokens + max(N_stereo, 0) + H_action
-        self.pos = nn.Parameter(torch.randn(1, seq_len, hidden_dim) * 0.02)
+        # positional-embedding buffer (N_v is dynamic → use max-len and slice)
+        self.pos = nn.Parameter(torch.randn(1, pos_max_len, hidden_dim) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -99,35 +92,33 @@ class ZoneMemoryActionHead(nn.Module):
         )
 
     def forward_step(self, h_A, h_V, state, stereo=None):
-        """One timestep. h_A:[B,N_act,Hin] h_V:[B,N_v,Hin] state:[B,state_dim] stereo:[B,N_stereo,hd]|None -> [B,H_action,action_dim]."""
+        """One timestep.
+        h_A:[B,N_act,Hin] h_V:[B,N_v,Hin] state:[B,state_dim] stereo:[B,N_stereo,hd]|None
+        -> [B,H_action,action_dim].
+        """
         B = h_A.shape[0]
-        cmd = self.cmd_proj(h_A)                                   # [B, N_act, hd]
-
-        v = h_V.transpose(1, 2)                                    # [B, Hin, N_v]
-        v = self.vis_pool(v)                                       # [B, Hin, N_vis]
-        vis = self.vis_proj(v.transpose(1, 2))                     # [B, N_vis, hd]
-
-        st = self.state_proj(state).view(B, self.N_state_tokens, -1)  # [B, N_state, hd]
-        q = self.action_query.expand(B, -1, -1)                    # [B, H_action, hd]
+        cmd = self.cmd_proj(h_A)                                       # [B, N_act, hd]
+        vis = self.vis_proj(h_V)                                       # [B, N_v, hd]  (raw, N_v dynamic)
+        st = self.state_proj(state).view(B, self.N_state_tokens, -1)   # [B, N_state, hd]
+        q = self.action_query.expand(B, -1, -1)                        # [B, H_action, hd]
 
         parts = [cmd, vis, st]
         if self.N_stereo > 0 and stereo is not None:
-            stereo_proj = self.stereo_proj(stereo)                  # [B, N_stereo, hd]
-            parts.append(stereo_proj)
+            parts.append(self.stereo_norm(stereo))                     # [B, N_stereo, hd]
         parts.append(q)
-        seq = torch.cat(parts, dim=1)                               # [B, seq_len, hd]
-        seq = seq + self.pos[:, : seq.shape[1], :]
-        out = self.transformer(seq)                                 # bidirectional (no mask)
+        seq = torch.cat(parts, dim=1)                                  # [B, seq_len, hd]
+        seq = seq + self.pos[:, : seq.shape[1], :]                     # slice pos to seq_len
+        out = self.transformer(seq)                                    # bidirectional (no mask)
 
-        action_out = out[:, -self.H_action :, :]                    # query positions
-        return self.decoder(action_out)                             # [B, H_action, action_dim]
+        action_out = out[:, -self.H_action :, :]                       # query positions
+        return self.decoder(action_out)                                # [B, H_action, action_dim]
 
     def forward(self, h_A, h_V, state, actions_target=None, stereo=None):
         """
         h_A: [B, T, N_act, input_dim]
         h_V: [B, T, N_v,   input_dim]
         state: [B, T, state_dim]
-        stereo: [B, T, N_stereo, stereo_dim] | None
+        stereo: [B, T, N_stereo, hidden_dim] | None
         actions_target (optional): [B, T, H_action, action_dim]
         Returns: loss (if target given) else predictions [B, T, H_action, action_dim].
         """
@@ -151,21 +142,27 @@ class ZoneMemoryActionHead(nn.Module):
 
 
 def get_action_model(config=None):
-    """Factory: build ZoneMemoryActionHead from global framework config."""
+    """Factory: build ZoneMemoryActionHead from global framework config.
+
+    N_act / N_stereo are read from ``config.framework.qwenzone.*`` (single source of truth).
+    vis is NOT pooled (raw N_v tokens), so N_vis_tokens is gone. stereo_dim == hidden_size.
+    """
     am = config.framework.action_model
+    qz = config.framework.qwenzone
     assert am.action_model_type == "ZoneMemory", (
         f"ZoneMemory factory expects action_model_type=='ZoneMemory', got {am.action_model_type}"
     )
+    hidden_size = int(am.get("hidden_size", 512))
+    n_stereo = int(qz.get("stereo", {}).get("N_stereo_tokens", 0)) if qz.get("stereo") else 0
+
     return ZoneMemoryActionHead(
         input_dim=am.action_hidden_dim,
-        hidden_dim=int(am.get("hidden_size", 512)),
+        hidden_dim=hidden_size,
         action_dim=am.action_dim,
         H_action=int(am.action_horizon),
-        N_act=int(am.get("N_act", 8)),
-        N_vis_tokens=int(am.get("N_vis_tokens", 8)),
+        N_act=int(qz.get("N_act", 16)),
         N_state_tokens=int(am.get("N_state_tokens", 4)),
-        N_stereo=int(am.get("N_stereo", 8)),
-        stereo_dim=int(am.get("stereo_dim", am.get("hidden_size", 512))),
+        N_stereo=n_stereo,
         state_dim=int(am.get("state_dim", am.action_dim)),
         nhead=int(am.get("nhead", 8)),
         num_layers=int(am.get("num_transformer_layers", 4)),
@@ -173,31 +170,29 @@ def get_action_model(config=None):
 
 
 if __name__ == "__main__":
-    B, T, H_in, N_v = 2, 4, 2560, 192
-    N_act, ACTION_DIM, H_ACTION = 8, 14, 50
+    B, T, H_in, N_v = 2, 4, 2560, 64   # N_v=64 (224×224 Qwen tokens), unpooled
+    N_act, N_STEREO, ACTION_DIM, H_ACTION = 16, 64, 14, 50
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = ZoneMemoryActionHead(
         input_dim=H_in, hidden_dim=512, action_dim=ACTION_DIM, H_action=H_ACTION,
-        N_act=N_act, N_vis_tokens=8, N_state_tokens=4, state_dim=ACTION_DIM,
+        N_act=N_act, N_state_tokens=4, N_stereo=N_STEREO, state_dim=28,
         nhead=8, num_layers=4,
     ).to(device)
     print(f"params: {sum(p.numel() for p in model.parameters()):,}")
+    seq_len = N_act + N_v + 4 + N_STEREO + H_ACTION
+    print(f"per-step seq len: {seq_len} (cmd{N_act}+vis{N_v}+state4+stereo{N_STEREO}+query{H_ACTION})")
 
     h_A = torch.randn(B, T, N_act, H_in, device=device)
     h_V = torch.randn(B, T, N_v, H_in, device=device)
-    state = torch.randn(B, T, ACTION_DIM, device=device)
+    state = torch.randn(B, T, 28, device=device)
+    stereo = torch.randn(B, T, N_STEREO, 512, device=device)
 
-    # training: loss is scalar
     target = torch.randn(B, T, H_ACTION, ACTION_DIM, device=device)
-    loss = model(h_A, h_V, state, target)
+    loss = model(h_A, h_V, state, target, stereo=stereo)
     print(f"train loss: {loss.item():.4f} (scalar={loss.dim()==0})")
 
-    # inference: shape
-    pred = model.predict_action(h_A, h_V, state)
+    pred = model.predict_action(h_A, h_V, state, stereo=stereo)
     print(f"pred shape: {tuple(pred.shape)} (expected ({B},{T},{H_ACTION},{ACTION_DIM}))")
-    assert tuple(pred.shape) == (B, T, H_ACTION, ACTION_DIM)
-
-    # backward sanity
     loss.backward()
     print("backward OK")

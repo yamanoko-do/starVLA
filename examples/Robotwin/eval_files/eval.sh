@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 6 ]]; then
-    echo "Usage: bash examples/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host]" >&2
+    echo "Usage: bash examples/Robotwin/eval_files/eval.sh <task_name> <task_config> <ckpt_setting> <seed> <gpu_id> <policy_ckpt_path> [policy_port] [policy_host] [test_num]" >&2
     exit 1
 fi
 
@@ -49,6 +49,7 @@ gpu_id="${5:-0}"
 policy_ckpt_path="$6"
 policy_port="${7:-${ROBOTWIN_POLICY_PORT:-5694}}"
 policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
+test_num="${9:-${ROBOTWIN_TEST_NUM:-100}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 
@@ -70,6 +71,11 @@ sed \
 
 export CUDA_VISIBLE_DEVICES="${gpu_id}"
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
+
+# Put the robotwin env's bin dir on PATH so subprocesses (e.g. ffmpeg) launched
+# by eval_policy.py resolve correctly even though we don't `conda activate`.
+robotwin_bin_dir="$(dirname "${robotwin_python}")"
+export PATH="${robotwin_bin_dir}:${PATH}"
 
 EVAL_FILES_PATH="${SCRIPT_DIR}"
 STARVLA_PATH="${REPO_ROOT}"
@@ -94,4 +100,5 @@ PYTHONWARNINGS=ignore::UserWarning \
     --task_config "${task_config}" \
     --ckpt_setting "${ckpt_setting}" \
     --seed "${seed}" \
-    --policy_name "${policy_name}"
+    --policy_name "${policy_name}" \
+    --test_num "${test_num}"

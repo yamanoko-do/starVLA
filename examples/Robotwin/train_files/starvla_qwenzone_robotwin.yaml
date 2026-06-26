@@ -4,7 +4,7 @@
 # Usage:
 #   python starVLA/training/train_starvla.py \
 #     --config examples/Robotwin/train_files/starvla_qwenzone_robotwin.yaml
-run_id: qwenzone_click_bell_t4
+run_id: qwenzone_click_bell_t4v2
 run_root_dir: results/Checkpoints_QwenZone
 seed: 42
 wandb_entity: qwenzone
@@ -20,14 +20,14 @@ framework:
 
   qwenzone:
     T_obs: 4                                       # sequence time steps (match dataset T_obs)
-    N_act: 4                                       # action-intent tokens per step
+    N_act: 16                                      # cmd (action-intent) tokens per step
     N_mem: 4                                       # memory tokens per step
     max_history: 16                                # inference history cap
     stereo:
       ckpt_path: /mnt/workspace/yama/OpenStereo/output/MultiDataset/WAVEStereo/wavestereo_mixdataset/20260623_wavestereo_filter/ckpt/checkpoint_epoch_2.pth
       update_iters: 4                              # N iterations of update_block
-      pool_size: 8                                 # spatial grid for pooling
-      N_stereo_tokens: 8                           # output token count
+      N_stereo_tokens: 64                          # stereo tokens (cat + ResConv×2 + adaptive pool)
+      input_size: [256, 256]                       # stereo image resize (square → /8 → pool 8×8)
 
   action_model:
     action_model_type: ZoneMemory
@@ -36,13 +36,11 @@ framework:
     action_horizon: 50
     action_hidden_dim: 2560                        # overwritten by VLM hidden_size
     hidden_size: 512
-    N_act: 4                                        # must match qwenzone.N_act
-    N_vis_tokens: 8
     N_state_tokens: 4
-    N_stereo: 8                                    # stereo tokens per step (0 = disable)
-    stereo_dim: 512                                # input dim from StereoEncoder
     nhead: 8
     num_transformer_layers: 4
+    # N_act / N_stereo / stereo_dim are read from qwenzone.* (single source of truth)
+    # vis is NOT pooled: raw VLM vision tokens (N_v per step) fed directly to the head
 
 datasets:
   vla_data:

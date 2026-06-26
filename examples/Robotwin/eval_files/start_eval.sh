@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Site defaults (local override; uses :=, so caller-provided env wins) ---
+: "${ROBOTWIN_PATH:=/mnt/workspace/yama/RoboTwin}"
+: "${ROBOTWIN_STARVLA_ENV:=starVLA}"
+: "${ROBOTWIN_ENV:=RoboTwin}"
+: "${HF_HOME:=/mnt/workspace/yama/oss_yama/cache/hf_cache/hub}"
+: "${HF_MODULES_CACHE:=/mnt/workspace/yama/oss_yama/cache/hf_cache/modules}"
+: "${HF_DATASETS_CACHE:=/mnt/workspace/yama/oss_yama/cache/hf_cache/datasets}"
+: "${TORCH_HOME:=/mnt/workspace/yama/oss_yama/cache/torch_cache}"
+: "${HF_ENDPOINT:=https://hf-mirror.com}"
+: "${STARVLA_CKPT_PATH:=/mnt/workspace/yama/oss_yama/cache/hf_cache/hub/hub/models--StarVLA--Qwen3-VL-OFT-RoboTwin2-All/snapshots/727645249e6bfbff6870db4637e4b9d32e6be346/checkpoints/steps_140000_pytorch_model.pt}"
+export ROBOTWIN_PATH ROBOTWIN_STARVLA_ENV ROBOTWIN_ENV \
+       HF_HOME HF_MODULES_CACHE HF_DATASETS_CACHE TORCH_HOME HF_ENDPOINT \
+       STARVLA_CKPT_PATH
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ROBOTWIN_ALL_TASKS=(
@@ -126,6 +140,7 @@ Tasks (positional):
 
 Optional flags:
   -s, --seed              Eval seed (default: 0, env: ROBOTWIN_SEED)
+  -t, --test-num          Number of episodes per task (default: 100, env: ROBOTWIN_TEST_NUM)
   -j, --jobs-per-gpu      Concurrent jobs per GPU (default: 1, env: ROBOTWIN_JOBS_PER_GPU)
   -p, --base-port         First port to allocate (default: 5694, env: ROBOTWIN_BASE_PORT)
       --server-timeout    Seconds to wait for server (default: 600, env: ROBOTWIN_SERVER_TIMEOUT)
@@ -390,6 +405,8 @@ launch_task_in_slot() {
             "${gpu_id}" \
             "${CKPT_PATH}" \
             "${port}" \
+            "" \
+            "${opt_test_num:-}" \
             > >(tee "${eval_log}" | grep --line-buffered "Success rate" | sed -u "s/^/[RESULT] ${task_name}: /") 2>&1
     ) &
 
@@ -404,12 +421,13 @@ launch_task_in_slot() {
 
 TASK_CONFIG=""
 POLICY_NAME=""
-CKPT_PATH=""
+CKPT_PATH="${STARVLA_CKPT_PATH:-}"
 opt_seed=""
 opt_jobs=""
 opt_port=""
 opt_timeout=""
 opt_install=false
+opt_test_num=""
 
 while (( $# > 0 )); do
     case "$1" in
@@ -417,6 +435,7 @@ while (( $# > 0 )); do
         -n|--name)          POLICY_NAME="$2"; shift 2 ;;
         -c|--ckpt)          CKPT_PATH="$2"; shift 2 ;;
         -s|--seed)          opt_seed="$2"; shift 2 ;;
+        -t|--test-num)      opt_test_num="$2"; shift 2 ;;
         -j|--jobs-per-gpu)  opt_jobs="$2"; shift 2 ;;
         -p|--base-port)     opt_port="$2"; shift 2 ;;
         --server-timeout)   opt_timeout="$2"; shift 2 ;;
@@ -428,7 +447,7 @@ while (( $# > 0 )); do
 done
 
 if [[ -z "${TASK_CONFIG}" || -z "${POLICY_NAME}" || -z "${CKPT_PATH}" ]]; then
-    echo "Missing required flags: -m/--mode, -n/--name, -c/--ckpt" >&2
+    echo "Missing required flags: -m/--mode, -n/--name, -c/--ckpt (or set STARVLA_CKPT_PATH)" >&2
     usage
     exit 1
 fi

@@ -21,6 +21,10 @@ if [[ "${ROBOTWIN_USE_BF16:-1}" != "0" ]]; then
     use_bf16_flag+=(--use_bf16)
 fi
 
+# Put the starvla env's bin dir on PATH for any subprocesses spawned by the server.
+starvla_bin_dir="$(dirname "${star_vla_python}")"
+export PATH="${starvla_bin_dir}:${PATH}"
+
 echo "[INFO] Starting RoboTwin policy server"
 echo "[INFO] checkpoint: ${your_ckpt}"
 echo "[INFO] gpu: ${gpu_id}"

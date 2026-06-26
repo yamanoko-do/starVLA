@@ -95,9 +95,14 @@ class QwenZoneDefaultConfig:
     qwenzone: dict = field(
         default_factory=lambda: {
             "T_obs": 4,        # sequence time steps
-            "N_act": 8,        # action-intent tokens per step
-            "N_mem": 8,        # memory tokens per step (and for M_init)
+            "N_act": 16,       # cmd (action-intent) tokens per step
+            "N_mem": 4,        # memory tokens per step (and for M_init)
             "max_history": 16, # inference: cap history length
+            "stereo": {
+                "update_iters": 4,
+                "N_stereo_tokens": 64,
+                "input_size": [256, 256],
+            },
         }
     )
 
@@ -105,15 +110,15 @@ class QwenZoneDefaultConfig:
         default_factory=lambda: {
             "action_model_type": "ZoneMemory",
             "action_dim": 14,
-            "state_dim": 14,
+            "state_dim": 28,
             "action_horizon": 50,
             "action_hidden_dim": 2560,  # overwritten by VLM hidden_size at runtime
             "hidden_size": 512,
-            "N_act": 8,
-            "N_vis_tokens": 8,
             "N_state_tokens": 4,
             "nhead": 8,
             "num_transformer_layers": 4,
+            # N_act / N_stereo / stereo_dim read from qwenzone.* (single source of truth)
+            # vis is NOT pooled (raw N_v tokens)
         }
     )
 
@@ -140,11 +145,6 @@ class Qwenvl_Zone(baseframework):
         self.max_history = int(qz.get("max_history", 16))
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
-        # consistency: sequence N_act must equal action head N_act
-        assert int(self.config.framework.action_model.get("N_act", self.N_act)) == self.N_act, (
-            "qwenzone.N_act must equal action_model.N_act"
-        )
-
         tok = self.processor.tokenizer
         self.action_token_id = self._single_token_id(tok, "🔍")
         self.memory_token_id = self._single_token_id(tok, "🧠")
@@ -159,9 +159,9 @@ class Qwenvl_Zone(baseframework):
             self.stereo_encoder = StereoEncoder(
                 ckpt_path=stereo_cfg["ckpt_path"],
                 update_iters=int(stereo_cfg.get("update_iters", 4)),
-                pool_size=int(stereo_cfg.get("pool_size", 8)),
                 hidden_dim=int(self.config.framework.action_model.get("hidden_size", 512)),
-                N_stereo_tokens=int(stereo_cfg.get("N_stereo_tokens", 8)),
+                N_stereo_tokens=int(stereo_cfg.get("N_stereo_tokens", 64)),
+                input_size=tuple(stereo_cfg.get("input_size", [256, 256])),
             )
         else:
             self.stereo_encoder = None
@@ -300,7 +300,7 @@ class Qwenvl_Zone(baseframework):
 
         # determine T from the data (may differ between training and inference)
         B = len(examples)
-        has_stereo = all("stereo_left" in ex and "stereo_right" in ex for ex in examples)
+        has_stereo = all(ex.get("stereo_left") and ex.get("stereo_right") for ex in examples)
         if not has_stereo:
             return None
 
@@ -395,15 +395,22 @@ class Qwenvl_Zone(baseframework):
         # doesn't leak across episodes.
         cur_lang = examples[0].get("lang", "") if examples else ""
         if self._infer_history is None or getattr(self, "_last_lang", None) != cur_lang:
-            self._infer_history = [{"imgs": [], "states": []} for _ in examples]
+            self._infer_history = [
+                {"imgs": [], "states": [], "stereo_left": [], "stereo_right": []} for _ in examples
+            ]
             self._last_lang = cur_lang
         for i, ex in enumerate(examples):
             cur_imgs = [to_pil_preserve(im) for im in ex["image"]]  # [num_cam] current step
             self._infer_history[i]["imgs"].append(cur_imgs)
             self._infer_history[i]["states"].append(np.asarray(ex["state"], dtype=np.float32))
+            # stereo: accumulate per-step left/right pair (must match training _extract_stereo)
+            if self.stereo_encoder is not None and ex.get("stereo_left") and ex.get("stereo_right"):
+                self._infer_history[i]["stereo_left"].append(to_pil_preserve(ex["stereo_left"][0]))
+                self._infer_history[i]["stereo_right"].append(to_pil_preserve(ex["stereo_right"][0]))
             if len(self._infer_history[i]["imgs"]) > self.max_history:
-                self._infer_history[i]["imgs"] = self._infer_history[i]["imgs"][-self.max_history :]
-                self._infer_history[i]["states"] = self._infer_history[i]["states"][-self.max_history :]
+                for k in ("imgs", "states", "stereo_left", "stereo_right"):
+                    if self._infer_history[i][k]:
+                        self._infer_history[i][k] = self._infer_history[i][k][-self.max_history :]
 
         device = next(self.qwen_vl_interface.parameters()).device
         T = len(self._infer_history[0]["imgs"])
@@ -414,7 +421,8 @@ class Qwenvl_Zone(baseframework):
         for i, ex in enumerate(examples):
             h = self._infer_history[i]
             images_by_cam = [[h["imgs"][t][c] for t in range(T)] for c in range(len(h["imgs"][0]))]
-            hist_examples.append({"image": images_by_cam, "lang": ex["lang"]})
+            hist_examples.append({"image": images_by_cam, "lang": ex["lang"],
+                                  "stereo_left": h["stereo_left"], "stereo_right": h["stereo_right"]})
             hist_states.append(np.stack(h["states"]))  # [T, state_dim]
 
         seqs = [self._build_sequence(he, he["image"]) for he in hist_examples]

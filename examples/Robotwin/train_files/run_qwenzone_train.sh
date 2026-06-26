@@ -15,7 +15,7 @@ export PATH=/mnt/workspace/yama/miniconda3/envs/starVLA/bin:$PATH
 
 NUM_GPUS=${NUM_GPUS:-2}
 MAX_STEPS=${MAX_STEPS:-5000}
-OUTPUT_DIR=results/Checkpoints_QwenZone/qwenzone_click_bell_t4
+OUTPUT_DIR=results/Checkpoints_QwenZone/qwenzone_click_bell_t4v2
 
 mkdir -p ${OUTPUT_DIR}
 

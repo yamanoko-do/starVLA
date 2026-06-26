@@ -7,13 +7,15 @@ Extracts fine-grained stereo-geometry tokens from a stereo pair (left + right):
   - encoding_volume[0]: 48-channel cost-aggregation features at 1/4 resolution
   - net after N update iterations: 64-channel iterative refinement features at 1/4 resolution
 
-Both are pooled to a fixed spatial grid, projected, and concatenated into
-``N_stereo_tokens`` of ``hidden_dim`` each, fed to the action-head transformer.
+These two are CONCATENATED early (112 ch), then fused & downsampled by two
+trainable ResConv blocks, finally adaptive-pooled to 8×8 = N_stereo_tokens (64)
+spatial tokens. Output dimension == hidden_dim (512) directly from ResConv2,
+so no extra projection is needed.
 
 Usage::
 
-    stereo = StereoEncoder(cfg=stereo_cfg)
-    tokens = stereo(left_img, right_img)          # [B, N_stereo, hidden_dim]
+    stereo = StereoEncoder(ckpt_path=..., hidden_dim=512, N_stereo_tokens=64)
+    tokens = stereo(left_img, right_img)   # [B, 64, 512]
 """
 
 import sys
@@ -34,57 +36,75 @@ from stereo.modeling.models.wavestereo.geometry import Geo_Encoding_Volume
 from stereo.modeling.models.wavestereo.utils import InputPadder
 
 
+class ResConvBlock(nn.Module):
+    """ResNet-style basic block: Conv3×3-BN-ReLU-Conc3×3-BN + identity + ReLU.
+
+    `stride` controls spatial downsampling (stride=2 halves H,W).
+    """
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        # identity path matches dims when in/out or stride differ
+        if stride != 1 or in_ch != out_ch:
+            self.identity = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+        else:
+            self.identity = nn.Identity()
+
+    def forward(self, x):
+        identity = self.identity(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu(out + identity)
+
+
 class StereoEncoder(nn.Module):
-    """Frozen WAVEStereo wrapper that extracts intermediate features as learnable tokens."""
+    """Frozen WAVEStereo wrapper → fused stereo tokens via early-cat + ResConv fusion."""
 
     def __init__(
         self,
         ckpt_path: str,
         config_path: str | None = None,
         update_iters: int = 4,       # N: how many update_block iterations to run
-        pool_size: int = 8,           # K: spatial grid for pooling feature maps
-        hidden_dim: int = 512,        # token embedding dimension (must match action head)
-        N_stereo_tokens: int = 8,     # output token count
+        hidden_dim: int = 512,        # token dim (== action head hidden_size); ResConv2 output ch
+        N_stereo_tokens: int = 64,    # output token count (8×8 spatial grid)
+        input_size: tuple = (256, 256),  # stereo image resize (H, W)
     ):
         super().__init__()
         self.update_iters = update_iters
-        self.pool_size = pool_size
         self.hidden_dim = hidden_dim
         self.N_stereo_tokens = N_stereo_tokens
+        self.input_size = tuple(input_size)
+        # spatial grid for the final adaptive pool (sqrt(N_stereo_tokens))
+        self.grid = int(round(N_stereo_tokens ** 0.5))
+        assert self.grid * self.grid == N_stereo_tokens, (
+            f"N_stereo_tokens={N_stereo_tokens} must be a perfect square (8×8=64)"
+        )
 
         model = self._build_model(ckpt_path, config_path)
         self._set_model(model)   # plain attr → DeepSpeed bf16 conversion skips it
 
-        # encoding_volume[0]: 48 channels → project
-        self.encoding_proj = nn.Sequential(
-            nn.LayerNorm(48),
-            nn.Linear(48, hidden_dim),
-        )
-        # net (after N iters): 64 channels → project
-        self.net_proj = nn.Sequential(
-            nn.LayerNorm(64),
-            nn.Linear(64, hidden_dim),
-        )
-        # merge pooled encoding + net tokens → N_stereo tokens
-        total_spatial = 2 * pool_size * pool_size
-        self.merger = nn.Sequential(
-            nn.LayerNorm(total_spatial * hidden_dim),
-            nn.Linear(total_spatial * hidden_dim, N_stereo_tokens * hidden_dim),
+        # Early-fuse + downsample: cat(enc0[48] + net[64]=112) → 256 (stride2) → 512
+        self.fuse = nn.Sequential(
+            ResConvBlock(48 + 64, 256, stride=2),   # [B, 256, H/8, W/8]
+            ResConvBlock(256, hidden_dim, stride=1),  # [B, 512, H/8, W/8]
         )
 
     @staticmethod
     def _build_model(ckpt_path, config_path=None):
-        """Build WAVEStereo and load checkpoint weights."""
         from easydict import EasyDict
         from stereo.utils.common_utils import config_loader
         from stereo.modeling.models.wavestereo.wavestereo import WAVEStereo
 
         if config_path is None:
-            config_path = str(
-                _OPENSTEREO_ROOT
-                / "cfgs/wavestereo/wavestereo_mixdataset.yaml"
-            )
-
+            config_path = str(_OPENSTEREO_ROOT / "cfgs/wavestereo/wavestereo_mixdataset.yaml")
         raw_cfg = config_loader(config_path)
         model = WAVEStereo(EasyDict(raw_cfg["MODEL"]))
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -96,38 +116,32 @@ class StereoEncoder(nn.Module):
         return model
 
     def _get_model(self):
-        """Access the frozen WAVEStereo (stored as plain attr to avoid DeepSpeed bf16)."""
         return self._frozen_model
 
     def _set_model(self, model):
-        # Keep as plain attribute so DeepSpeed/accelerate dtype conversions skip it
+        # plain attr so DeepSpeed/accelerate dtype conversions skip it
         object.__setattr__(self, "_frozen_model", model)
 
     def forward(self, left_img, right_img):
-        """Extract stereo-geometry tokens."""
+        """Extract stereo tokens → [B, N_stereo_tokens, hidden_dim]."""
         B = left_img.shape[0]
-        model = self._get_model()  # frozen WAVEStereo (plain attr, not nn.Module child)
+        model = self._get_model()
 
-        # Ensure model is on the same device as input (plain attr skips .cuda())
         if next(model.parameters()).device != left_img.device:
             model = model.to(left_img.device)
 
-        # DeepSpeed bf16 training converts all nn.Parameters to bf16. The frozen
-        # WAVEStereo (plain attr) escapes this, but StereoEncoder's own projection
-        # layers don't. Force everything to float32 for this forward pass.
+        # StereoEncoder's own modules may be bf16 under DeepSpeed → force fp32
         self.float()
 
-        # Frozen WAVEStereo (BatchNorm) requires float32. Disable autocast so the
-        # entire partial forward runs in fp32 regardless of the caller's context.
+        # Frozen WAVEStereo (BatchNorm) requires float32; disable autocast
         with torch.amp.autocast('cuda', enabled=False):
             left_img = left_img.float()
             right_img = right_img.float()
 
-            # pad to dimensions divisible by 32 (FPN downsampling requirement)
             padder = InputPadder(left_img.shape, divis_by=32)
             left_img, right_img = padder.pad(left_img, right_img)
 
-            # -- partial forward (mirrors WAVEStereo.forward lines 75--105) ----------
+            # -- partial forward (mirrors WAVEStereo.forward) -------------------
             features_left = model.backbone(left_img)
             features_right = model.backbone(right_img)
 
@@ -168,34 +182,28 @@ class StereoEncoder(nn.Module):
                 )
                 disp = disp + delta_disp
 
-            # -- extract tokens --------------------------------------------------
-            enc0 = encoding_volume[0]
-            enc_pool = F.adaptive_avg_pool2d(enc0, (self.pool_size, self.pool_size))
-            enc_pool = enc_pool.permute(0, 2, 3, 1).flatten(1, 2)
-            enc_tok = self.encoding_proj(enc_pool)    # [B, K², hd] — fp32 here
+            # -- early fuse: cat on channel, then ResConv fusion + downsample ----
+            # enc0: [B, 48, H/4, W/4], net: [B, 64, H/4, W/4]
+            fused_in = torch.cat([encoding_volume[0], net], dim=1)   # [B, 112, H/4, W/4]
+            fused = self.fuse(fused_in)                              # [B, 512, H/8, W/8]
 
-            net_pool = F.adaptive_avg_pool2d(net, (self.pool_size, self.pool_size))
-            net_pool = net_pool.permute(0, 2, 3, 1).flatten(1, 2)
-            net_tok = self.net_proj(net_pool)          # [B, K², hd] — fp32 here
+            # adaptive pool to fixed spatial grid (sqrt(N_stereo_tokens))
+            pooled = F.adaptive_avg_pool2d(fused, (self.grid, self.grid))  # [B,512,8,8]
+            # → [B, grid, grid, hidden_dim] → flatten → [B, N_stereo_tokens, hidden_dim]
+            tokens = pooled.permute(0, 2, 3, 1).flatten(1, 2)
 
-        all_tokens = torch.cat([enc_tok, net_tok], dim=1)           # [B, 2K², hd]
-        merged = self.merger(all_tokens.flatten(1))                 # [B, N_stereo*hd]
-        return merged.view(B, self.N_stereo_tokens, self.hidden_dim)
+        return tokens  # [B, N_stereo_tokens, hidden_dim]
 
 
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, "/mnt/workspace/yama/OpenStereo")
-
     ckpt = "/mnt/workspace/yama/OpenStereo/output/MultiDataset/WAVEStereo/wavestereo_mixdataset/20260623_wavestereo_filter/ckpt/checkpoint_epoch_2.pth"
-    encoder = StereoEncoder(ckpt_path=ckpt).cuda()
+    encoder = StereoEncoder(ckpt_path=ckpt, hidden_dim=512, N_stereo_tokens=64, input_size=(256, 256)).cuda()
     n = sum(p.numel() for p in encoder.parameters()) / 1e6
-    print(f"StereoEncoder params: {n:.1f}M (frozen + trainable)")
+    n_train = sum(p.numel() for p in encoder.parameters() if p.requires_grad) / 1e6
+    print(f"StereoEncoder params: {n:.1f}M total, {n_train:.1f}M trainable (fuse blocks)")
 
-    # dummy stereo pair (ImageNet-normalised)
-    left = torch.randn(2, 3, 256, 512, device="cuda")
-    right = torch.randn(2, 3, 256, 512, device="cuda")
-
+    left = torch.randn(2, 3, 256, 256, device="cuda")
+    right = torch.randn(2, 3, 256, 256, device="cuda")
     with torch.no_grad():
         tokens = encoder(left, right)
-    print(f"output shape: {tuple(tokens.shape)}  (expected: (2, {encoder.N_stereo_tokens}, {encoder.hidden_dim}))")
+    print(f"output: {tuple(tokens.shape)}  (expected (2, 64, 512))")
