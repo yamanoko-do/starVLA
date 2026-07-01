@@ -30,6 +30,8 @@ def main(args) -> None:
         ckpt_path=args.ckpt_path,
         device="cuda",
         use_bf16=args.use_bf16,
+        infer_mode=args.infer_mode,
+        vlm_stride=args.vlm_stride,
     )
 
     hostname = socket.gethostname()
@@ -54,6 +56,12 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument("--infer_mode", type=str, default=None, choices=["full", "rnn"],
+                        help="Inference mode: full (mode-1, complete history) or rnn (mode-2)")
+    parser.add_argument("--vlm_stride", type=int, default=0,
+                        help="LLM refresh cadence: 0 = run the LLM every step (synchronous); "
+                             ">0 = refresh the LLM every K steps and reuse the cached action intent "
+                             "in between (async, requires K-1 <= d_max)")
     return parser
 
 

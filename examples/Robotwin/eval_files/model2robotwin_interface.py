@@ -84,6 +84,13 @@ class ModelClient:
         # Reset state tracking for delta/rel modes
         self.initial_state = None
         self.prev_action = None
+        # Reset server-side episode state (QwenZone full-history buffer + RNN m_state),
+        # so memory/history doesn't bleed across episodes of the same task.
+        if hasattr(self, "client") and hasattr(self.client, "reset"):
+            try:
+                self.client.reset()
+            except Exception as e:
+                print(f"[reset] server reset_history failed: {e}")
 
     def step(
         self,

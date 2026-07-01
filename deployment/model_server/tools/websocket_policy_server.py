@@ -137,6 +137,18 @@ class WebsocketPolicyServer:
                 "data": data,
             }
 
+        # reset --> framework.reset_history (clear full-history buffer + RNN m_state)
+        elif mtype == "reset":
+            try:
+                self._policy.reset_history()
+            except Exception as e:
+                logging.exception("Policy reset error (request_id=%s)", req_id)
+                return {
+                    "status": "error", "ok": False, "type": "reset", "request_id": req_id,
+                    "error": {"message": str(e)},
+                }
+            return {"status": "ok", "ok": True, "type": "reset", "request_id": req_id}
+
         # unknow request type
         else:
             return {

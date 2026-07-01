@@ -398,6 +398,16 @@ class VLATrainer(TrainerUtils):
 
         return {
             "train/action_loss": action_loss.item(),
+            **(
+                {"train/parallel_loss": float(output_dict["parallel_loss"])}
+                if "parallel_loss" in output_dict
+                else {}
+            ),
+            **(
+                {"train/rnn_loss": float(output_dict["rnn_loss"])}
+                if "rnn_loss" in output_dict
+                else {}
+            ),
         }
 
     def _finalize_training(self):

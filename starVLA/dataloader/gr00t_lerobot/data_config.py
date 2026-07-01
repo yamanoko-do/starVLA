@@ -1245,7 +1245,7 @@ class QwenZoneRobotwinDataConfig:
     }
     language_keys = ["annotation.human.action.task_description"]
 
-    T_OBS = 4            # sequence time steps (override via data_cfg["T_obs"])
+    TRAIN_SEQ_LEN = 4            # sequence time steps (override via data_cfg["train_seq_len"])
     ACTION_HORIZON = 50  # H: action chunk length predicted at each step
 
     def set_data_cfg(self, cfg: dict | None):
@@ -1255,7 +1255,7 @@ class QwenZoneRobotwinDataConfig:
     @property
     def _T(self) -> int:
         cfg = getattr(self, "_data_cfg", None) or {}
-        return int(cfg.get("T_obs", self.T_OBS))
+        return int(cfg.get("train_seq_len", self.TRAIN_SEQ_LEN))
 
     @property
     def observation_indices(self):
@@ -1310,7 +1310,7 @@ class QwenZoneRobotwinDataConfig:
         """Factory hook: return an HDF5-based dataset for raw RoboTwin data."""
         from starVLA.dataloader.gr00t_lerobot.hdf5_robotwin_dataset import HDF5RobotwinDataset
 
-        T = int(data_cfg.get("T_obs", self.T_OBS)) if data_cfg else self.T_OBS
+        T = int(data_cfg.get("train_seq_len", self.TRAIN_SEQ_LEN)) if data_cfg else self.TRAIN_SEQ_LEN
         H = int(data_cfg.get("action_horizon", self.ACTION_HORIZON)) if data_cfg else self.ACTION_HORIZON
         return HDF5RobotwinDataset(dataset_path, T=T, H=H)
 

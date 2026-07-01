@@ -66,7 +66,10 @@ class HDF5RobotwinDataset(Dataset):
                 total = f["joint_action/vector"].shape[0]
             # stride ensures non-overlapping windows (e.g., T=4 → stride 4)
             stride = max(1, T)
-            for t0 in range(0, total - T - H + 1, stride):
+            # a window only needs T observations; action chunks that run past the episode
+            # end are padded with the last valid action (see __getitem__), so windows cover
+            # the whole episode instead of wasting its trailing ~H steps.
+            for t0 in range(0, total - T + 1, stride):
                 self.samples.append((ep_idx, t0))
 
         # Action/state normalization ranges (Aloha agilex joints + grippers)
@@ -156,7 +159,14 @@ class HDF5RobotwinDataset(Dataset):
                 stereo_right.append(sr.resize(self.stereo_size))
 
             # --- action: vector layout is [L6, Lg, R6, Rg] → reorder to starVLA [L6, R6, Lg, Rg] → normalize
-            raw_vec = f["joint_action/vector"][t0 : t0 + self.T + self.H - 1].astype(np.float32)
+            # sample T+H-1 steps; when the window runs past the episode end, pad the tail by
+            # repeating the last valid action so the full [T+H-1, 14] shape is preserved
+            # (no downstream mask needed — late-step observations learn to hold the final pose).
+            need = self.T + self.H - 1
+            raw_vec = f["joint_action/vector"][t0 : t0 + need].astype(np.float32)
+            if raw_vec.shape[0] < need:
+                pad = np.repeat(raw_vec[-1:], need - raw_vec.shape[0], axis=0)
+                raw_vec = np.concatenate([raw_vec, pad], axis=0)
             raw_action = np.concatenate(
                 [raw_vec[:, 0:6], raw_vec[:, 7:13], raw_vec[:, 6:7], raw_vec[:, 13:14]], axis=1
             )  # [T+H-1, 14] in [L6, R6, Lg, Rg]

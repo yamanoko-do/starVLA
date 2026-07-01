@@ -81,3 +81,12 @@ class WebsocketClientPolicy:
         if isinstance(response, str):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
+
+    def reset(self) -> Dict:
+        """Tell the server to reset the framework's episode state (history / RNN m_state)."""
+        data = self._packer.pack({"type": "reset"})
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)

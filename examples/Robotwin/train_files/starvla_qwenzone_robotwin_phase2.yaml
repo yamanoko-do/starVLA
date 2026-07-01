@@ -1,16 +1,16 @@
-# QwenZone Phase 1 training config — RoboTwin 2.0
-# memory-token VLA with block-wise attention
+# QwenZone Phase 2 training config — dual-Pass (parallel + RNN) + async delay δ
+# Implements the full tt.md design: Pass2 RNN forward + async δ + RNN inference (mode-2).
 #
 # Usage:
-#   python starVLA/training/train_starvla.py \
-#     --config examples/Robotwin/train_files/starvla_qwenzone_robotwin.yaml
-run_id: qwenzone_click_bell_t4v2
+#   bash examples/Robotwin/train_files/run_qwenzone_train_phase2.sh
+#   NUM_GPUS=2 MAX_STEPS=50000 bash examples/Robotwin/train_files/run_qwenzone_train_phase2.sh
+run_id: qwenzone_click_bell_20260630
 run_root_dir: results/Checkpoints_QwenZone
 seed: 42
 wandb_entity: qwenzone
 wandb_project: qwenzone
 is_debug: false
-version_id: "0.1"
+version_id: "0.2"
 
 framework:
   name: QwenZone
@@ -19,15 +19,19 @@ framework:
     attn_implementation: sdpa                     # 4D additive mask requires sdpa
 
   qwenzone:
-    train_seq_len: 4                                # training sequence length in timesteps
+    train_seq_len: 8                                       # sequence time steps (increased from 4 to 8)
     N_act: 16                                      # cmd (action-intent) tokens per step
     N_mem: 4                                       # memory tokens per step
-    max_history: 16                                # inference history cap
+    max_history: 16                                # inference history cap (mode-1)
+    # ── Phase 2 ──
+    lambda_rnn: 1.0                                # Pass2 (RNN) loss weight; raised to 1.0 for stronger RNN training
+    d_max: 8                                       # async action delay: δ ~ U{t-d_max, ..., t}; increased to 8
+    infer_mode: full                               # post-train eval both modes; default full
     stereo:
       ckpt_path: /mnt/workspace/yama/OpenStereo/output/MultiDataset/WAVEStereo/wavestereo_mixdataset/20260623_wavestereo_filter/ckpt/checkpoint_epoch_2.pth
       update_iters: 4                              # N iterations of update_block
       N_stereo_tokens: 64                          # stereo tokens (cat + ResConv×2 + adaptive pool)
-      input_size: [224, 224]                       # stereo image resize (224×224, no padding, matches VLM)
+      input_size: [224, 224]                       # stereo image resize (224×224, no padding needed, matches VLM)
 
   action_model:
     action_model_type: ZoneMemory
@@ -39,6 +43,11 @@ framework:
     N_state_tokens: 4
     nhead: 8
     num_transformer_layers: 4
+    # token随机遮蔽参数 (训练时正则化，推理时关闭)
+    vis_mask_probability: 0.5                      # 每个训练step有50%概率应用视觉遮蔽
+    vis_mask_ratio: 1                               # 视觉遮蔽比例上限，实际在[0, vis_mask_ratio]间随机选择
+    cmd_mask_probability: 0.5                       # 每个训练step有50%概率应用cmd遮蔽
+    cmd_mask_ratio: 1                               # cmd遮蔽比例上限，实际在[0, cmd_mask_ratio]间随机选择
     # N_act / N_stereo / stereo_dim are read from qwenzone.* (single source of truth)
     # vis is NOT pooled: raw VLM vision tokens (N_v per step) fed directly to the head
 
@@ -48,18 +57,18 @@ datasets:
     include_state: true
     data_root_dir: /mnt/workspace/yama/RoboTwin/data
     data_mix: click_bell                             # sub-directory name
-    train_seq_len: 4                                # training sequence length in timesteps
-    per_device_batch_size: 1                        # T=2, H=50, stereo → keep small
+    train_seq_len: 8                                        # sequence time steps (increased from 4 to 8)
+    per_device_batch_size: 1                        # dual-Pass + stereo → keep small
     load_all_data_for_training: true
     obs_image_size: [224, 224]
     video_backend: torchvision_av
     shuffle: true
 
 trainer:
-  max_train_steps: 500000
+  max_train_steps: 50000
   num_warmup_steps: 2000
   save_interval: 5000
-  eval_interval: 99999999                              # chunk model: disable trainer MSE eval (assumes single-step); use sim eval instead
+  eval_interval: 99999999                              # chunk model: disable trainer MSE eval; use sim eval instead
   learning_rate:
     base: 2.0e-05
     qwen_vl_interface: 1.0e-05                     # VLM backbone: conservative lr

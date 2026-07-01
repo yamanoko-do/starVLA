@@ -65,7 +65,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         from starVLA.dataloader.gr00t_lerobot.hdf5_robotwin_dataset import HDF5RobotwinDataset
 
         vla_cfg = cfg.datasets.vla_data
-        T = int(vla_cfg.get("T_obs", 2))
+        T = int(vla_cfg.get("train_seq_len", 2))
         H = int(vla_cfg.get("action_horizon", 50))
         ds = HDF5RobotwinDataset(Path(vla_cfg.data_root_dir) / vla_cfg.data_mix, T=T, H=H)
         train_dataloader = DataLoader(

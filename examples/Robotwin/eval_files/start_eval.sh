@@ -387,8 +387,10 @@ launch_task_in_slot() {
         export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
         export STARVLA_PYTHON="${STARVLA_PYTHON}"
         export ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON}"
+        export ROBOTWIN_INFER_MODE="${ROBOTWIN_INFER_MODE:-full}"
+        export ROBOTWIN_VLM_STRIDE="${ROBOTWIN_VLM_STRIDE:-0}"
 
-        bash "${SCRIPT_DIR}/run_policy_server.sh" "${CKPT_PATH}" "${gpu_id}" "${port}" > "${server_log}" 2>&1 &
+        bash "${SCRIPT_DIR}/run_policy_server.sh" "${CKPT_PATH}" "${gpu_id}" "${port}" "${ROBOTWIN_INFER_MODE}" > "${server_log}" 2>&1 &
         server_pid=$!
 
         if ! wait_for_server "${port}" "${ROBOTWIN_SERVER_TIMEOUT:-600}"; then

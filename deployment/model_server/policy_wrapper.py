@@ -42,6 +42,8 @@ class PolicyServerWrapper:
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
+        infer_mode: Optional[str] = None,
+        vlm_stride: Optional[int] = None,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
 
@@ -50,6 +52,24 @@ class PolicyServerWrapper:
         if use_bf16:
             framework = framework.to(torch.bfloat16)
         framework = framework.to(device).eval()
+
+        # Set inference mode (full/rnn) if specified
+        if infer_mode is not None:
+            if hasattr(framework, "infer_mode"):
+                framework.infer_mode = str(infer_mode)
+                logging.info("PolicyServerWrapper: infer_mode set to %s", infer_mode)
+            else:
+                logging.warning("PolicyServerWrapper: framework does not support infer_mode, ignoring")
+
+        # Set vlm_stride (async LLM refresh cadence) if specified.
+        # 0 = synchronous (run the LLM every step); >0 = refresh every K steps.
+        if vlm_stride is not None:
+            if hasattr(framework, "vlm_stride"):
+                framework.vlm_stride = int(vlm_stride)
+                logging.info("PolicyServerWrapper: vlm_stride set to %d", framework.vlm_stride)
+            else:
+                logging.warning("PolicyServerWrapper: framework does not support vlm_stride, ignoring")
+
         self._framework = framework
 
         # Co-located metadata.
@@ -67,6 +87,13 @@ class PolicyServerWrapper:
             raise ValueError(
                 f"PolicyServerWrapper: no action_horizon or future_action_window_size found in model config for {self._ckpt_path}"
             )
+        # Async stride (vlm_stride > 0): the action head runs EVERY step with a cached (stale) intent +
+        # fresh observation, while the LLM only refreshes every vlm_stride steps. The client must
+        # therefore query every step and consume action[0] → report chunk_size=1.
+        if getattr(self._framework, "vlm_stride", 0) > 0:
+            self._action_chunk_size = 1
+            logging.info("PolicyServerWrapper: vlm_stride=%d → action_chunk_size overridden to 1",
+                         self._framework.vlm_stride)
         # Cache of PolicyNormProcessor instances per unnorm_key.
         # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
         # ckpts clients must pass unnorm_key per request.
@@ -122,6 +149,13 @@ class PolicyServerWrapper:
             base["action_keys"] = proc.action_keys
             base["state_keys"] = proc.state_keys
         return base
+
+    def reset_history(self) -> None:
+        """Reset the framework's internal episode state (full-history buffer + RNN m_state).
+        Called by the eval server between episodes so history/memory doesn't bleed across
+        episodes of the same task (where ``lang`` is unchanged and auto-reset wouldn't fire)."""
+        if hasattr(self._framework, "reset_history"):
+            self._framework.reset_history()
 
     def predict_action(
         self,
